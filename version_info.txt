@@ -1,0 +1,42 @@
+# PyInstaller version resource for ClaudeUsage.
+#
+# Why this exists: without an embedded version resource, Windows shows the app
+# by its raw filename -- "claudeusage.exe" -- in Task Manager, the file's
+# Properties dialog, and (the reason it was added) the notification toast's app
+# name. FileDescription is the field Windows surfaces in most of those places;
+# ProductName backs it up.
+#
+# CompanyName is deliberately NOT "Anthropic": this is a third-party tool that
+# reads the Claude usage API, not an Anthropic product, and claiming otherwise
+# in a shipped binary's metadata would misrepresent its origin.
+VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=(1, 0, 0, 0),
+        prodvers=(1, 0, 0, 0),
+        mask=0x3F,
+        flags=0x0,
+        OS=0x40004,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo(
+            [
+                StringTable(
+                    "040904B0",
+                    [
+                        StringStruct("CompanyName", "ClaudeUsage"),
+                        StringStruct("FileDescription", "ClaudeUsage"),
+                        StringStruct("FileVersion", "1.0.0.0"),
+                        StringStruct("InternalName", "ClaudeUsage"),
+                        StringStruct("OriginalFilename", "ClaudeUsage.exe"),
+                        StringStruct("ProductName", "ClaudeUsage"),
+                        StringStruct("ProductVersion", "1.0.0.0"),
+                    ],
+                )
+            ]
+        ),
+        VarFileInfo([VarStruct("Translation", [0x0409, 0x04B0])]),
+    ],
+)

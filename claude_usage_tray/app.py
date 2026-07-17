@@ -2,330 +2,98 @@
 
 from __future__ import annotations
 
-import os
+import logging
 import queue
-import subprocess
-import sys
 import threading
 import tkinter as tk
-from datetime import datetime, timezone
-from pathlib import Path
-from tkinter import filedialog, messagebox
-from typing import Any
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from tkinter import messagebox
+from typing import Any, Mapping
 
-if sys.platform == "win32":
-    import winreg
-
-from PIL import Image, ImageDraw, ImageTk
+from PIL import ImageTk
 
 import pystray
 
+from . import (
+    alerts,
+    formatting,
+    icons,
+    logging_setup,
+    paths,
+    platform,
+    quotas,
+    settings as settings_model,
+    ui,
+)
 from .api import fetch_usage_bundle
-from .config import ClaudeProfile, default_profile, load_profiles, normalize_config_dir, save_profiles
+from .config import ClaudeProfile, ConfigCorrupted, load_config, save_config
+from .ui.widgets import apply_window_icon
 
 POLL_SECONDS = 300
-WINDOW_TITLE = "Uso Claude"
-BG = "#262522"
-PANEL = "#2f2d29"
-TRACK = "#4a4743"
-FG = "#f7f3ee"
-MUTED = "#b9b1a6"
-ACCENT = "#d97757"
-WARN = "#f59e0b"
-DANGER = "#ef4444"
-LINK = "#8ab4ff"
-BORDER = "#3a3733"
-DAY_NAMES = ["lun.", "mar.", "mie.", "jue.", "vie.", "sab.", "dom."]
-STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-STARTUP_VALUE_NAME = "ClaudeUsage"
-APP_ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "claude_usage_icon.ico"
 
+# The notify-icon id to ask the shell about when resolving our tray icon's
+# rectangle. pystray publishes neither the window handle nor the icon id, so
+# both are discovered rather than declared: `0` is the value the design-phase
+# spike measured answering on pystray's win32 backend, and `_hwnd` is the
+# private attribute it found the handle on. This is the fragile part of the
+# custom-tooltip path by construction -- a pystray upgrade could move either
+# -- which is exactly why failing to resolve them degrades to the native
+# tooltip instead of raising (tray-tooltip spec, "Native Tooltip Remains the
+# Fallback").
+TRAY_ICON_UID = 0
+_TRAY_HWND_ATTRIBUTE = "_hwnd"
 
-def _pct(entry: dict[str, Any] | None) -> float | None:
-    if not entry:
-        return None
-    try:
-        return float(entry.get("utilization", 0))
-    except (TypeError, ValueError):
-        return None
+# Spanish labels for the three quota windows an alert can name. Kept as a name
+# here because this module's toast has used it since it existed, but it is
+# `quotas.py`'s dict now, not a second copy of it: the alerts control in
+# `ui/settings_window.py` labels a field per quota window and cannot import
+# this module (`ui` is L4, `app` is L5 -- that edge points up), so the one
+# thing that had to be true, that a toast and that window call the same quota
+# the same thing, is now structural rather than a promise to remember.
+ALERT_WINDOW_LABELS = quotas.QUOTA_WINDOW_LABELS
 
+# The explicit AppUserModelID this process declares to Windows. Dotted
+# `CompanyName.ProductName` is Microsoft's documented convention for these
+# ids; a bare "ClaudeUsage" also works but the dotted form is the correct,
+# collision-resistant spelling. Set once at startup so the shell attributes
+# tray toasts to this identity rather than to `python.exe`/`claudeusage.exe`.
+APP_USER_MODEL_ID = "Anthropic.ClaudeUsage"
 
-def _reset_text(iso_str: str | None) -> str:
-    if not iso_str:
-        return "—"
-    try:
-        reset = datetime.fromisoformat(iso_str)
-        now = datetime.now(timezone.utc)
-        diff = reset - now
-        total_min = max(0, int(diff.total_seconds() // 60))
-        clock = reset.astimezone().strftime("%H:%M")
-        if total_min >= 60:
-            return f"en {total_min // 60}h {total_min % 60}m ({clock})"
-        if total_min > 0:
-            return f"en {total_min}m ({clock})"
-        return f"pronto ({clock})"
-    except Exception:
-        return "—"
-
-
-def _reset_label(iso_str: str | None) -> str:
-    if not iso_str:
-        return "Se restablece: —"
-    try:
-        reset = datetime.fromisoformat(iso_str).astimezone()
-        now = datetime.now().astimezone()
-        if reset.date() == now.date():
-            total_sec = max(0, int((reset - now).total_seconds()))
-            if total_sec < 60:
-                return "Se restablece pronto"
-            total_min = total_sec // 60
-            if total_min < 60:
-                return f"Se restablece en {total_min} min"
-            hours = total_min // 60
-            mins = total_min % 60
-            if mins == 0:
-                return f"Se restablece en {hours} h"
-            return f"Se restablece en {hours} h {mins} min"
-        day = DAY_NAMES[reset.weekday()]
-        return f"Se restablece {day} {reset.strftime('%H:%M')} hs"
-    except Exception:
-        return "Se restablece: —"
-
-
-def _startup_command() -> str:
-    if getattr(sys, "frozen", False):
-        return f'"{sys.executable}"'
-    exe = sys.executable
-    if exe.lower().endswith("python.exe"):
-        exe = exe[:-10] + "pythonw.exe"
-    launcher = Path(__file__).resolve().parent.parent / "launcher.py"
-    return f'"{exe}" "{launcher}"'
-
-
-def _is_startup_enabled() -> bool:
-    if sys.platform != "win32":
-        return False
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_READ) as key:
-            winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
-        return True
-    except OSError:
-        return False
-
-
-def _set_startup_enabled(enabled: bool) -> None:
-    if sys.platform != "win32":
-        return
-    with winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE
-    ) as key:
-        if enabled:
-            winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, _startup_command())
-        else:
-            try:
-                winreg.DeleteValue(key, STARTUP_VALUE_NAME)
-            except FileNotFoundError:
-                pass
-
-
-def _bar_color(pct: float) -> str:
-    if pct >= 90:
-        return DANGER
-    if pct >= 70:
-        return WARN
-    return ACCENT
-
-
-def _tooltip(bundle: dict[str, Any]) -> str:
-    profiles = bundle.get("profiles")
-    if isinstance(profiles, list) and profiles:
-        lines = ["Claude — uso"]
-        for item in profiles[:4]:
-            profile = item.get("profile")
-            data = item.get("data", {})
-            session = _pct(data.get("session"))
-            weekly = _pct(data.get("weekly"))
-            if session is None and weekly is None:
-                error = data.get("error", "Sin datos")
-                name = profile.name if isinstance(profile, ClaudeProfile) else "Perfil"
-                lines.append(f"{name}: {error}")
-                continue
-            parts = []
-            if session is not None:
-                parts.append(f"5h {session:.0f}%")
-            if weekly is not None:
-                parts.append(f"7d {weekly:.0f}%")
-            name = profile.name if isinstance(profile, ClaudeProfile) else "Perfil"
-            lines.append(f"{name}: {' · '.join(parts)}")
-        return "\n".join(lines)
-
-    data = bundle.get("primary", bundle)
-    if data.get("error") and _pct(data.get("session")) is None and _pct(data.get("weekly")) is None:
-        return f"Claude uso\n{data['error']}"
-
-    session = _pct(data.get("session"))
-    weekly = _pct(data.get("weekly"))
-    fable = _pct(data.get("weekly_fable"))
-    lines = ["Claude — uso"]
-    warning = data.get("meta", {}).get("warning")
-    if warning:
-        lines.append("Mostrando la ultima informacion disponible")
-    if session is not None:
-        lines.append(f"5h: {session:.0f}%")
-    if weekly is not None:
-        lines.append(f"7d: {weekly:.0f}%")
-    if fable is not None:
-        lines.append(f"Fable: {fable:.0f}%")
-    if warning:
-        lines.append(warning)
-    return "\n".join(lines)
-
-
-def _availability_pct(data: dict[str, Any]) -> float | None:
-    values: list[float] = []
-    for key in ("session", "weekly", "weekly_fable"):
-        used = _pct(data.get(key))
-        if used is None:
-            continue
-        values.append(max(0.0, min(100.0, 100.0 - used)))
-    if not values:
-        return None
-    return min(values)
-
-
-def _availability_pct_from_bundle(bundle: dict[str, Any]) -> float | None:
-    profile_items = bundle.get("profiles")
-    values: list[float] = []
-    if isinstance(profile_items, list) and profile_items:
-        for item in profile_items:
-            if not isinstance(item, dict):
-                continue
-            data = item.get("data")
-            if isinstance(data, dict):
-                availability = _availability_pct(data)
-                if availability is not None:
-                    values.append(availability)
-    else:
-        data = bundle.get("primary", bundle)
-        if isinstance(data, dict):
-            availability = _availability_pct(data)
-            if availability is not None:
-                values.append(availability)
-    if not values:
-        return None
-    return min(values)
-
-
-def _tray_level(availability: float | None) -> int:
-    if availability is None:
-        return 0
-    if availability >= 80:
-        return 4
-    if availability >= 50:
-        return 3
-    if availability >= 20:
-        return 2
-    return 1
-
-
-def _work_area_bounds() -> tuple[int, int, int, int]:
-    """Return (left, top, right, bottom) of the usable desktop area."""
-    if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        class RECT(ctypes.Structure):
-            _fields_ = [
-                ("left", wintypes.LONG),
-                ("top", wintypes.LONG),
-                ("right", wintypes.LONG),
-                ("bottom", wintypes.LONG),
-            ]
-
-        rect = RECT()
-        ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)
-        return rect.left, rect.top, rect.right, rect.bottom
-    return 0, 0, 0, 0
-
-
-def _updated_text(updated_at: datetime | None) -> str:
-    if updated_at is None:
-        return "Ultima actualizacion: sin datos"
-    now = datetime.now()
-    diff_seconds = max(0, int((now - updated_at).total_seconds()))
-    if diff_seconds < 60:
-        human = "hace menos de un minuto"
-    else:
-        minutes = diff_seconds // 60
-        human = f"hace {minutes} min"
-    return f"Ultima actualizacion: {human}"
-
-
-def _parse_meta_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-        return dt.astimezone().replace(tzinfo=None)
-    except Exception:
-        return None
-
-
-def _make_icon(bundle: dict[str, Any]) -> Image.Image:
-    data = bundle.get("primary", bundle)
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    session = _pct(data.get("session"))
-    weekly = _pct(data.get("weekly"))
-
-    if data.get("error") and session is None and weekly is None:
-        draw.rounded_rectangle((6, 6, 58, 58), radius=14, fill=PANEL)
-        draw.rounded_rectangle((28, 14, 36, 40), radius=4, fill=DANGER)
-        draw.ellipse((28, 46, 36, 54), fill=DANGER)
-        return img
-
-    draw.rounded_rectangle((6, 6, 58, 58), radius=14, fill=PANEL)
-    active_bars = _tray_level(_availability_pct_from_bundle(bundle))
-    heights = [14, 22, 30, 38]
-    left = 13
-    bottom = 50
-    bar_width = 8
-    gap = 4
-
-    for index, height in enumerate(heights, start=1):
-        x1 = left + (index - 1) * (bar_width + gap)
-        x2 = x1 + bar_width
-        y1 = bottom - height
-        draw.rounded_rectangle((x1, y1, x2, bottom), radius=3, fill=TRACK)
-        if index <= active_bars:
-            draw.rounded_rectangle((x1, y1, x2, bottom), radius=3, fill=ACCENT)
-
-    draw.rounded_rectangle((11, 10, 53, 52), radius=10, outline=BORDER, width=2)
-    return img
-
-
-def _window_icon_image(size: int = 32) -> Image.Image:
-    img = Image.new("RGBA", (size, size), BG)
-    draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle((2, 2, size - 2, size - 2), radius=7, fill=PANEL, outline=BORDER, width=1)
-    heights = [7, 11, 15, 19]
-    left = 6
-    bottom = size - 6
-    bar_width = 4
-    gap = 2
-    for index, height in enumerate(heights):
-        x1 = left + index * (bar_width + gap)
-        x2 = x1 + bar_width
-        y1 = bottom - height
-        draw.rounded_rectangle((x1, y1, x2, bottom), radius=2, fill=ACCENT)
-    return img
+log = logging.getLogger(__name__)
 
 
 class UsageTrayApp:
     def __init__(self) -> None:
-        self._profiles = load_profiles()
+        config_load = load_config()
+        self._config = config_load.config
+        self._profiles = self._config.profiles
+        self._read_only = config_load.read_only
+        # config.py carries the settings blob raw (it and settings.py are
+        # both L2, so neither may import the other). This is the composition
+        # root: mapping raw <-> Settings is its job, not the store's.
+        settings_load = settings_model.load(self._config.settings)
+        self._settings = settings_load.settings
+        self._theme = settings_model.build_theme(self._settings)
+        # Both stores get to report at load. They are separate notice types on
+        # purpose -- one means irreplaceable data was quarantined, the other
+        # that a hand-typed colour was dropped -- and merging the lists here
+        # is what lets `_show_notices` stay the single place that decides how
+        # loudly each is said.
+        notices: list[Any] = [*config_load.notices, *settings_load.notices]
+        log.info(
+            "config loaded: %d profile(s), read_only=%s, %d notice(s), theme=%s, font_size=%d, %d custom color(s)",
+            len(self._profiles),
+            self._read_only,
+            len(notices),
+            self._settings.theme,
+            self._settings.font_size,
+            len(self._settings.colors),
+        )
+        self._alert_state = alerts.prune(
+            alerts.load_state(paths.alert_state_file()),
+            {profile.id for profile in self._profiles},
+        )
         self._data: dict[str, Any] = {
             "primary": {"error": "Cargando…"},
             "profiles": [],
@@ -335,24 +103,49 @@ class UsageTrayApp:
         self._stop = threading.Event()
         self._ui_queue: queue.Queue = queue.Queue()
         self._popup: tk.Toplevel | None = None
-        self._profiles_window: tk.Toplevel | None = None
+        # One window, two tabs -- so one reference, plus the two pieces of its
+        # render state that have to outlive its rebuilds. The tray menu still
+        # offers both entries; each just opens this window on its own tab.
+        self._main_window: tk.Toplevel | None = None
+        self._active_tab: str = ui.TAB_PROFILES
+        # `settings.colors` as of the moment the window was last opened: what
+        # the settings tab's per-colour "volver" goes back to. It lives here
+        # because every colour change rebuilds that window, so a baseline
+        # captured inside it would reset on the first change and leave revert
+        # with nothing to return to.
+        self._color_baseline: Mapping[str, str] = {}
+        self._hover_popup: tk.Toplevel | None = None
+        self._hover_tracker: ui.HoverTracker | None = None
+        # Start on the native tooltip and earn the custom one: `_hwnd`, the
+        # icon id and a readable rect are all discovered at runtime, and
+        # anything we cannot confirm must leave the user with the tooltip
+        # that has always worked.
+        self._native_tooltip = True
         self._root = tk.Tk()
         self._root.withdraw()
-        self._window_icon = ImageTk.PhotoImage(_window_icon_image())
-        self._apply_window_icon(self._root)
+        # Route Tk callback exceptions into the log. Tk's default handler
+        # prints them to stderr, which under `--windowed` means nowhere.
+        self._root.report_callback_exception = logging_setup.tk_exception_handler()
+        self._window_icon = ImageTk.PhotoImage(icons.window_icon(self._theme.palette))
+        apply_window_icon(self._root, self._window_icon)
+        self._dismiss_manager = ui.DismissManager(self._root)
         self._root.after(100, self._process_ui_queue)
+
+        if notices:
+            self._run_on_ui(lambda: self._show_notices(notices, read_only=config_load.read_only))
 
         menu_items: list[Any] = [
             pystray.MenuItem("Ver uso", self._on_show, default=True),
             pystray.MenuItem("Actualizar", self._on_refresh),
             pystray.MenuItem("Perfiles", self._on_manage_profiles),
+            pystray.MenuItem("Configuracion", self._on_settings),
         ]
-        if sys.platform == "win32":
+        if platform.startup_supported():
             menu_items.append(
                 pystray.MenuItem(
                     "Iniciar con Windows",
                     self._on_toggle_startup,
-                    checked=lambda _item: _is_startup_enabled(),
+                    checked=lambda _item: platform.is_startup_enabled(),
                 )
             )
         menu_items.extend(
@@ -362,28 +155,70 @@ class UsageTrayApp:
             ]
         )
         menu = pystray.Menu(*menu_items)
-        self._icon = pystray.Icon("claude-usage", _make_icon(self._data), _tooltip(self._data), menu)
+        self._icon = pystray.Icon(
+            "claude-usage",
+            icons.tray_icon(self._data, self._theme.palette),
+            formatting.tooltip(self._data),
+            menu,
+        )
 
-    def _apply_window_icon(self, window: tk.Misc) -> None:
-        try:
-            window.iconphoto(True, self._window_icon)
-        except tk.TclError:
-            pass
-        if sys.platform == "win32" and APP_ICON_PATH.exists():
-            try:
-                window.iconbitmap(default=str(APP_ICON_PATH))
-            except tk.TclError:
-                pass
+    def _show_notices(self, notices: list[Any], *, read_only: bool) -> None:
+        for notice in notices:
+            if isinstance(notice, ConfigCorrupted):
+                if notice.quarantined_to is not None:
+                    message = (
+                        "No se pudo leer el archivo de configuracion. Se guardo una copia en:\n"
+                        f"{notice.quarantined_to}\n\n"
+                        "Se creo una configuracion nueva; revisa esa copia si queres recuperar "
+                        "perfiles anteriores."
+                    )
+                else:
+                    message = (
+                        "No se pudo leer el archivo de configuracion y tampoco se pudo resguardar "
+                        "de forma segura."
+                    )
+                if read_only:
+                    message += (
+                        "\n\nLa aplicacion va a funcionar en modo solo lectura durante esta sesion: "
+                        "los cambios en los perfiles no se van a guardar."
+                    )
+                messagebox.showwarning("Configuracion", message, parent=self._root)
+            elif isinstance(notice, settings_model.InvalidColors):
+                # Deliberately quieter than the quarantine notice above, and
+                # deliberately not silent: nothing was lost, but a colour the
+                # user typed by hand did not take, and the only alternative
+                # is a window that inexplicably did not change.
+                fields = ", ".join(notice.fields)
+                messagebox.showinfo(
+                    "Configuracion",
+                    "No se pudieron usar estos colores personalizados y se dejo el color del tema:\n"
+                    f"{fields}\n\n"
+                    "Tienen que ser hexadecimales, por ejemplo #1a2b3c.",
+                    parent=self._root,
+                )
 
     def _process_ui_queue(self) -> None:
-        while True:
-            try:
-                fn = self._ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            fn()
-        if not self._stop.is_set():
-            self._root.after(100, self._process_ui_queue)
+        """Drain queued UI work, then re-arm.
+
+        The re-arm is in a `finally` and each task is individually guarded on
+        purpose. Previously an exception in a task escaped this method, so the
+        `after()` re-arm never ran and the pump died permanently -- one failing
+        task made every later click silently do nothing, which is far worse
+        than the original failure and looks nothing like it.
+        """
+        try:
+            while True:
+                try:
+                    fn = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn()
+                except Exception:
+                    log.exception("queued UI task failed")
+        finally:
+            if not self._stop.is_set():
+                self._root.after(100, self._process_ui_queue)
 
     def _run_on_ui(self, fn) -> None:
         self._ui_queue.put(fn)
@@ -392,175 +227,111 @@ class UsageTrayApp:
         primary = data.get("primary", data)
         with self._lock:
             self._data = data
-            fetched_at = _parse_meta_datetime(primary.get("meta", {}).get("fetched_at"))
+            fetched_at = formatting.parse_meta_datetime(primary.get("meta", {}).get("fetched_at"))
             self._updated_at = fetched_at or datetime.now()
-        self._icon.icon = _make_icon(data)
-        self._icon.title = _tooltip(data)
+        self._icon.icon = icons.tray_icon(data, self._theme.palette)
+        if self._native_tooltip:
+            # In custom-popup mode `title` is left empty and stays that way:
+            # a non-empty `szTip` makes the shell draw its own tooltip, which
+            # would sit next to ours saying the same thing. The popup reads
+            # `self._data` when it opens, so it needs no push here.
+            self._icon.title = formatting.tooltip(data)
+        self._process_alerts(data)
 
-    def _create_progress_row(
-        self,
-        parent: tk.Widget,
-        label: str,
-        entry: dict[str, Any] | None,
-        *,
-        top_pad: int = 8,
-        emphasis: bool = False,
-    ) -> tk.Frame:
-        pct = _pct(entry)
-        value = f"{pct:.0f}% usado" if pct is not None else "—"
+    def _process_alerts(self, data: dict[str, Any]) -> None:
+        """Run the poll through the alert state machine and deliver events.
 
-        row = tk.Frame(parent, bg=PANEL)
-        row.pack(fill="x", pady=(top_pad, 0))
-
-        header = tk.Frame(row, bg=PANEL)
-        header.pack(fill="x")
-
-        tk.Label(
-            header,
-            text=label,
-            bg=PANEL,
-            fg=FG,
-            font=("Segoe UI", 9, "bold" if emphasis else "normal"),
-            anchor="w",
-        ).pack(side="left")
-
-        tk.Label(
-            header,
-            text=_reset_label(entry.get("resets_at") if entry else None),
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 8),
-            anchor="e",
-        ).pack(side="right")
-
-        bar_row = tk.Frame(row, bg=PANEL)
-        bar_row.pack(fill="x", pady=(2, 0))
-
-        canvas = tk.Canvas(
-            bar_row,
-            width=252,
-            height=10,
-            bg=PANEL,
-            highlightthickness=0,
-            bd=0,
-        )
-        canvas.pack(side="left", fill="x", expand=True)
-
-        width = 252
-        bar_height = 6
-        y = 2
-        canvas.create_rectangle(0, y, width, y + bar_height, fill=TRACK, outline=TRACK)
-        if pct is not None:
-            fill_width = max(0, min(width, int(width * pct / 100)))
-            canvas.create_rectangle(0, y, fill_width, y + bar_height, fill=_bar_color(pct), outline=_bar_color(pct))
-
-        tk.Label(
-            bar_row,
-            text=value,
-            bg=PANEL,
-            fg=FG,
-            font=("Segoe UI", 8, "bold"),
-            anchor="e",
-        ).pack(side="right", padx=(8, 0))
-
-        return row
-
-    def _weekly_rows(self, data: dict[str, Any]) -> list[tuple[str, dict[str, Any] | None, bool]]:
-        rows: list[tuple[str, dict[str, Any] | None, bool]] = []
-        if data.get("weekly") is not None:
-            rows.append(("Ultimos 7 dias", data.get("weekly"), True))
-        if data.get("weekly_fable") is not None:
-            rows.append(("Fable en los ultimos 7 dias", data.get("weekly_fable"), False))
-        return rows
-
-    def _render_profile_section(self, parent: tk.Widget, title: str, data: dict[str, Any], *, top_pad: int) -> None:
-        section = tk.Frame(parent, bg=PANEL)
-        section.pack(fill="x", pady=(top_pad, 0))
-
-        tk.Label(
-            section,
-            text=title,
-            bg=PANEL,
-            fg=FG,
-            font=("Segoe UI", 10, "bold"),
-            anchor="w",
-        ).pack(fill="x")
-
-        warning = data.get("meta", {}).get("warning")
-        has_usage_data = _pct(data.get("session")) is not None or _pct(data.get("weekly")) is not None
-
-        if warning:
-            tk.Label(
-                section,
-                text=warning,
-                bg=PANEL,
-                fg=WARN,
-                font=("Segoe UI", 9, "bold"),
-                wraplength=340,
-                justify="left",
-                anchor="w",
-            ).pack(fill="x", pady=(4, 0))
-
-        if data.get("error") and not has_usage_data:
-            tk.Label(
-                section,
-                text=data["error"],
-                bg=PANEL,
-                fg=FG,
-                font=("Segoe UI", 9),
-                wraplength=340,
-                justify="left",
-                anchor="w",
-            ).pack(fill="x", pady=(5, 0))
+        Runs on whichever thread fetched -- the poll loop or a refresh
+        thread -- so the state swap is under the same lock the data swap
+        uses. Notification delivery stays outside it: `icon.notify` is a
+        cross-thread shell call that has no business holding a lock.
+        """
+        items: list[tuple[str, dict[str, Any]]] = []
+        names: dict[str, str] = {}
+        for entry in data.get("profiles") or []:
+            profile = entry.get("profile")
+            if not isinstance(profile, ClaudeProfile):
+                continue
+            items.append((profile.id, entry.get("data") or {}))
+            names[profile.id] = profile.name
+        if not items:
             return
 
-        self._create_progress_row(section, "Ultimas 5 horas", data.get("session"), top_pad=5, emphasis=True)
-        weekly_rows = self._weekly_rows(data)
-        for index, (label, entry, emphasis) in enumerate(weekly_rows):
-            self._create_progress_row(
-                section,
-                label,
-                entry,
-                top_pad=6,
-                emphasis=emphasis,
+        # Resolved here rather than inside `alerts`: the state machine stays
+        # ignorant of the settings model (they are both L2 and cannot import
+        # each other), and this is the composition root's job either way.
+        alert_settings = self._settings.alerts
+        # Resolved to a complete (profile x window) map here rather than left
+        # to `evaluate`'s own inheritance: this is the composition root, it is
+        # the only place that holds an `AlertSettings`, and `thresholds_for`
+        # is the one implementation of "override, else global" either side
+        # should be running. `evaluate` keeps its own fallback for callers
+        # (and tests) that hand it a partial map.
+        thresholds_by_profile = {
+            profile_id: {
+                window: alert_settings.thresholds_for(profile_id, window)
+                for window in quotas.QUOTA_WINDOWS
+            }
+            for profile_id, _ in items
+        }
+
+        # Inject the clock here rather than let `alerts` read one: the state
+        # machine stays pure and deterministic under test, and the composition
+        # root is the only place a wall clock belongs. The cooldown suppresses
+        # a repeat of the SAME (profile, window) within this interval.
+        now = datetime.now(timezone.utc)
+        cooldown = timedelta(minutes=alert_settings.min_interval_minutes)
+        with self._lock:
+            state = self._alert_state
+            new_state, events = alerts.evaluate(
+                state,
+                items,
+                alert_settings.thresholds,
+                thresholds_by_profile=thresholds_by_profile,
+                now=now,
+                cooldown=cooldown,
             )
+            changed = new_state != state
+            self._alert_state = new_state
+
+        if changed:
+            # Write only when something actually changed: in steady state
+            # almost no poll changes anything, so this turns ~288 writes/day
+            # into the handful that reflect a real crossing or rollover.
+            try:
+                alerts.save_state(paths.alert_state_file(), new_state)
+            except OSError:
+                # Losing this file costs at most one duplicate notification.
+                # It is never worth taking the app down for.
+                log.exception("could not persist alert state; continuing")
+
+        if not self._settings.alerts.enabled:
+            # evaluate() still ran, so the state stays warm and re-enabling
+            # alerts cannot produce a burst of stale ones.
+            return
+        for event in events:
+            self._notify_alert(event, names.get(event.profile_id, "Claude"))
+
+    def _notify_alert(self, event: alerts.AlertEvent, profile_name: str) -> None:
+        label = ALERT_WINDOW_LABELS.get(event.window, event.window)
+        try:
+            self._icon.notify(
+                f"{profile_name}: {label} alcanzo el {event.threshold}% ({event.pct:.0f}% usado)",
+                "Uso Claude",
+            )
+        except Exception:
+            # A backend that cannot toast must not kill the poll thread --
+            # the tray icon and popup still carry the same information.
+            log.exception("could not deliver alert notification")
 
     def _fetch_and_update(self) -> dict[str, Any]:
+        log.info("fetching usage for %d profile(s)", len(self._profiles))
         data = fetch_usage_bundle(self._profiles)
+        primary_error = data.get("primary", {}).get("error")
+        if primary_error:
+            log.warning("primary profile fetch reported: %s", primary_error)
         self._set_data(data)
         return data
-
-    def _same_profile_dir(self, left: Path, right: Path) -> bool:
-        try:
-            return left.expanduser().resolve() == right.expanduser().resolve()
-        except OSError:
-            return str(left.expanduser()).lower() == str(right.expanduser()).lower()
-
-    def _profile_status_text(self, profile: ClaudeProfile) -> str:
-        if profile.credentials_path.exists():
-            return "Listo para consultar el uso"
-        return "Hace falta iniciar sesion en esta carpeta"
-
-    def _suggested_claude_dir(self) -> Path:
-        return default_profile().config_dir
-
-    def _open_in_explorer(self, target: Path) -> None:
-        destination = target.expanduser()
-        if not destination.exists():
-            destination = destination.parent if destination.parent != destination else Path.home()
-        try:
-            if sys.platform == "win32":
-                os.startfile(str(destination))
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(destination)])
-            else:
-                subprocess.Popen(["xdg-open", str(destination)])
-        except Exception:
-            messagebox.showerror(
-                "Perfiles",
-                f"No se pudo abrir la carpeta:\n{destination}",
-                parent=self._profiles_window,
-            )
 
     def _refresh_after_profile_change(self) -> None:
         data = fetch_usage_bundle(self._profiles, force=True)
@@ -568,520 +339,338 @@ class UsageTrayApp:
         if self._popup and self._popup.winfo_exists():
             self._run_on_ui(lambda: self._show_popup(data))
 
-    def _persist_profiles(self) -> None:
-        save_profiles(self._profiles)
-        self._profiles = load_profiles()
+    def _persist_config(self) -> None:
+        if self._read_only:
+            return
+        try:
+            save_config(self._config)
+        except OSError:
+            log.exception("could not persist config")
 
-    def _prompt_add_profile(self, name: str, raw_path: str) -> bool:
-        profile_name = name.strip()
-        config_dir = normalize_config_dir(raw_path.strip())
-        if not profile_name:
-            messagebox.showerror("Perfil", "Ingresá un nombre visible para el perfil.", parent=self._profiles_window)
-            return False
-        if config_dir is None:
-            messagebox.showerror("Perfil", "Elegí una carpeta valida de Claude.", parent=self._profiles_window)
-            return False
-        if any(self._same_profile_dir(profile.config_dir, config_dir) for profile in self._profiles):
-            messagebox.showinfo("Perfil", "Esa carpeta ya esta agregada.", parent=self._profiles_window)
-            return False
+    def _on_profiles_changed(self, new_profiles: list[ClaudeProfile]) -> None:
+        previous = {profile.id: profile.config_dir for profile in self._profiles}
+        # A deleted profile's threshold override is the other half of the
+        # footprint `alerts.prune` clears below: without this, `config.json`
+        # keeps tier lists keyed by uuids nothing can reach again.
+        self._settings = settings_model.prune_profile_thresholds(
+            self._settings, {profile.id for profile in new_profiles}
+        )
+        # `replace` rather than a fresh AppConfig: the settings blob rides
+        # along, so a profile edit can never silently reset the user's theme
+        # (user-settings spec, "Settings survive independently of profile
+        # edits"). It is re-serialized rather than passed through because the
+        # prune above may have just changed it.
+        self._config = replace(
+            self._config,
+            profiles=new_profiles,
+            settings=settings_model.to_raw(self._settings),
+        )
+        self._profiles = new_profiles
+        self._persist_config()
 
-        base = default_profile()
-        self._profiles.append(
-            ClaudeProfile(
-                id=f"perfil-{len(self._profiles) + 1}",
-                name=profile_name,
-                config_dir=config_dir,
-                supports_refresh=self._same_profile_dir(config_dir, base.config_dir),
+        with self._lock:
+            state = alerts.prune(self._alert_state, {profile.id for profile in new_profiles})
+            for profile in new_profiles:
+                # A repointed path is a different account: drop its arm state
+                # rather than trusting the new account's resets_at to differ.
+                # Weekly windows can legitimately coincide.
+                if profile.id in previous and previous[profile.id] != profile.config_dir:
+                    state = alerts.invalidate_profile(state, profile.id)
+            changed = state != self._alert_state
+            self._alert_state = state
+        if changed:
+            try:
+                alerts.save_state(paths.alert_state_file(), state)
+            except OSError:
+                log.exception("could not persist alert state after a profile change")
+
+        threading.Thread(target=self._refresh_after_profile_change, daemon=True).start()
+
+    def _on_settings_changed(self, new_settings: settings_model.Settings) -> None:
+        log.info("settings changed: theme=%s, font_size=%d", new_settings.theme, new_settings.font_size)
+        self._settings = new_settings
+        self._theme = settings_model.build_theme(new_settings)
+        self._config = replace(self._config, settings=settings_model.to_raw(new_settings))
+        self._persist_config()
+
+        # Rebuild the theme-dependent images. Safe here: this runs on the Tk
+        # main thread (it is a widget command), and ImageTk.PhotoImage must
+        # not be constructed off it.
+        self._window_icon = ImageTk.PhotoImage(icons.window_icon(self._theme.palette))
+        apply_window_icon(self._root, self._window_icon)
+        with self._lock:
+            data = self._data
+        self._icon.icon = icons.tray_icon(data, self._theme.palette)
+
+        # Re-show in the new theme, on whatever tab the user is looking at.
+        # This is the settings tab's rerender: it cannot do its own, because
+        # the reply to a settings change is a different Theme and only this
+        # method can build one. The popup picks the theme up on its next show,
+        # which rebuilds it from scratch anyway.
+        self._show_main_window()
+
+    def _on_main_window_resized(self, window_size: str) -> None:
+        self._settings = settings_model.with_window_size(self._settings, window_size)
+        self._config = replace(self._config, settings=settings_model.to_raw(self._settings))
+        self._persist_config()
+
+    def _on_tab_changed(self, tab: str) -> None:
+        # The window rerenders itself on a tab switch; this is only so that a
+        # *settings*-driven rebuild afterwards re-shows the same tab instead
+        # of snapping back to the one the window was opened on.
+        self._active_tab = tab
+
+    def _show_main_window(self, tab: str | None = None) -> None:
+        """Show the managed window, on `tab` if the caller named one.
+
+        `tab=None` means "rebuild where we are" -- a theme change re-showing
+        the window the user is already looking at. A named tab means the tray
+        menu asked for it, which is a fresh visit: that is what re-arms the
+        colour baseline, so "volver al anterior color" means "the colour I
+        walked in with" rather than "the colour I had eight windows ago".
+        """
+        if tab is not None:
+            self._active_tab = tab
+            self._color_baseline = dict(self._settings.colors)
+        log.info("opening the main window on the %s tab", self._active_tab)
+        self._main_window = ui.show_main_window(
+            self._root,
+            self._profiles,
+            self._settings,
+            self._on_profiles_changed,
+            self._on_settings_changed,
+            tab=self._active_tab,
+            theme=self._theme,
+            existing=self._main_window,
+            window_icon=self._window_icon,
+            window_size=self._settings.window_size,
+            on_window_size_changed=self._on_main_window_resized,
+            on_tab_changed=self._on_tab_changed,
+            color_baseline=self._color_baseline,
+        )
+
+    # -- tray hover popup ---------------------------------------------------
+
+    def _start_hover_tracking(self) -> None:
+        """Promote to the custom hover popup, but only on evidence.
+
+        Three things must hold, and each is checked rather than assumed: the
+        platform can report a tray rect at all, pystray still keeps its window
+        handle where the spike found it, and the shell actually answers for
+        our icon *right now*. Any of them missing leaves `_native_tooltip`
+        true and the app behaving exactly as it did before this existed.
+
+        Must run after `icon.run()` has created the window -- `_hwnd` is
+        assigned inside pystray's `_run()`, so this is called from
+        `_on_icon_ready` for the same reason the first fetch is.
+        """
+        if not platform.tray_hover_supported():
+            log.info("tray hover not supported on this platform; keeping the native tooltip")
+            return
+
+        hwnd = getattr(self._icon, _TRAY_HWND_ATTRIBUTE, None)
+        if not isinstance(hwnd, int) or not hwnd:
+            log.warning(
+                "could not read pystray's %r; keeping the native tooltip", _TRAY_HWND_ATTRIBUTE
             )
-        )
-        self._persist_profiles()
-        threading.Thread(target=self._refresh_after_profile_change, daemon=True).start()
-        return True
-
-    def _delete_profile(self, profile: ClaudeProfile) -> None:
-        if profile.id == "principal":
             return
-        confirmed = messagebox.askyesno(
-            "Eliminar perfil",
-            f'Se quitara "{profile.name}" de esta lista.\n\nLa carpeta original no se borra.',
-            parent=self._profiles_window,
-        )
-        if not confirmed:
+
+        if platform.tray_icon_rect(hwnd, TRAY_ICON_UID) is None:
+            log.warning(
+                "the shell reported no rect for our tray icon (hwnd=%s uid=%s); "
+                "keeping the native tooltip",
+                hwnd,
+                TRAY_ICON_UID,
+            )
             return
-        self._profiles = [
-            item for item in self._profiles if not self._same_profile_dir(item.config_dir, profile.config_dir)
-        ]
-        self._persist_profiles()
-        self._show_profiles_window()
-        threading.Thread(target=self._refresh_after_profile_change, daemon=True).start()
 
-    def _show_profiles_window(self) -> None:
-        if self._profiles_window and self._profiles_window.winfo_exists():
-            self._profiles_window.destroy()
-
-        window = tk.Toplevel(self._root)
-        window.title("Perfiles de Claude")
-        window.configure(bg=BG)
-        window.resizable(False, False)
-        window.attributes("-topmost", True)
-        self._apply_window_icon(window)
-        self._profiles_window = window
-
-        frame = tk.Frame(window, bg=PANEL, padx=14, pady=14)
-        frame.pack(fill="both", expand=True)
-
-        tk.Label(
-            frame,
-            text="Perfiles agregados",
-            bg=PANEL,
-            fg=FG,
-            font=("Segoe UI", 11, "bold"),
-            anchor="w",
-        ).pack(fill="x")
-
-        tk.Label(
-            frame,
-            text="Agrega otros perfiles de Claude para ver su uso en un solo lugar.",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9),
-            anchor="w",
-        ).pack(fill="x", pady=(4, 0))
-
-        list_frame = tk.Frame(frame, bg=PANEL)
-        list_frame.pack(fill="x", pady=(10, 0))
-
-        for profile in self._profiles:
-            row = tk.Frame(list_frame, bg=BG, padx=10, pady=7)
-            row.pack(fill="x", pady=(0, 6))
-
-            title_row = tk.Frame(row, bg=BG)
-            title_row.pack(fill="x")
-
-            title = profile.name
-            if profile.id == "principal":
-                title = f"{title} (actual)"
-
-            tk.Label(
-                title_row,
-                text=title,
-                bg=BG,
-                fg=FG,
-                font=("Segoe UI", 9, "bold"),
-                anchor="w",
-            ).pack(side="left")
-
-            if profile.id != "principal":
-                tk.Button(
-                    title_row,
-                    text="Eliminar",
-                    command=lambda p=profile: self._delete_profile(p),
-                    bg=BG,
-                    fg=MUTED,
-                    activebackground=BG,
-                    activeforeground=FG,
-                    bd=0,
-                    padx=4,
-                    pady=0,
-                    font=("Segoe UI", 9),
-                    highlightthickness=0,
-                    relief="flat",
-                    cursor="hand2",
-                ).pack(side="right")
-
-            tk.Label(
-                row,
-                text=self._profile_status_text(profile),
-                bg=BG,
-                fg=ACCENT,
-                font=("Segoe UI", 8, "bold"),
-                anchor="w",
-            ).pack(fill="x", pady=(4, 0))
-
-            tk.Label(
-                row,
-                text=str(profile.config_dir),
-                bg=BG,
-                fg=MUTED,
-                font=("Segoe UI", 8),
-                wraplength=420,
-                justify="left",
-                anchor="w",
-            ).pack(fill="x", pady=(4, 0))
-
-        form = tk.Frame(frame, bg=PANEL)
-        form.pack(fill="x", pady=(6, 0))
-
-        tk.Label(
-            form,
-            text="Agregar otro perfil",
-            bg=PANEL,
-            fg=FG,
-            font=("Segoe UI", 10, "bold"),
-            anchor="w",
-        ).pack(fill="x")
-
-        name_var = tk.StringVar()
-        path_var = tk.StringVar()
-
-        tk.Label(form, text="Nombre", bg=PANEL, fg=MUTED, font=("Segoe UI", 8), anchor="w").pack(
-            fill="x", pady=(10, 0)
-        )
-        tk.Entry(
-            form,
-            textvariable=name_var,
-            bg=BG,
-            fg=FG,
-            insertbackground=FG,
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=BORDER,
-            highlightcolor=ACCENT,
-        ).pack(fill="x", ipady=5)
-
-        tk.Label(form, text="Carpeta de Claude", bg=PANEL, fg=MUTED, font=("Segoe UI", 8), anchor="w").pack(
-            fill="x", pady=(10, 0)
-        )
-
-        tk.Label(
-            form,
-            text=(
-                "Elegí la carpeta donde Claude guarda tu sesion.\n"
-                "Suele verse como: C:/Users/TU_USUARIO/.claude  o  \\\\wsl.localhost\\Ubuntu\\home\\TU_USUARIO\\.claude"
+        self._native_tooltip = False
+        self._icon.title = ""
+        self._hover_tracker = ui.HoverTracker(
+            rect_of=lambda: platform.tray_icon_rect(hwnd, TRAY_ICON_UID),
+            cursor_of=platform.cursor_position,
+            # Every callback hops to the Tk main thread through the queue that
+            # already exists: these fire on the tracker's polling thread, and
+            # widget work off the main thread is exactly the bug this app's
+            # `_ui_queue` was built to prevent.
+            on_enter=lambda rect: self._run_on_ui(lambda: self._show_hover_popup(rect)),
+            on_leave=lambda: self._run_on_ui(self._hide_hover_popup),
+            on_unavailable=lambda: self._run_on_ui(
+                lambda: self._fall_back_to_native_tooltip("the tray rect stopped resolving")
             ),
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 8),
-            wraplength=420,
-            justify="left",
-            anchor="w",
-        ).pack(fill="x", pady=(4, 0))
+        )
+        self._hover_tracker.start()
+        log.info("custom hover popup active (hwnd=%s uid=%s)", hwnd, TRAY_ICON_UID)
 
-        path_row = tk.Frame(form, bg=PANEL)
-        path_row.pack(fill="x", pady=(8, 0))
+    def _fall_back_to_native_tooltip(self, reason: str) -> None:
+        """Give up on the custom popup for the rest of the session.
 
-        tk.Entry(
-            path_row,
-            textvariable=path_var,
-            bg=BG,
-            fg=FG,
-            insertbackground=FG,
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=BORDER,
-            highlightcolor=ACCENT,
-        ).pack(side="left", fill="x", expand=True, ipady=5)
+        One-way on purpose: flapping between two tooltips as the shell's
+        answer comes and goes would be worse than either, and the native path
+        can always show something. Idempotent, because both the tracker and a
+        failed render can call it.
+        """
+        if self._native_tooltip:
+            return
+        log.warning("falling back to the native tooltip: %s", reason)
+        self._native_tooltip = True
+        if self._hover_tracker is not None:
+            self._hover_tracker.stop()
+            self._hover_tracker = None
+        self._hide_hover_popup()
+        with self._lock:
+            data = self._data
+        self._icon.title = formatting.tooltip(data)
 
-        tk.Button(
-            path_row,
-            text="Examinar",
-            command=lambda: path_var.set(
-                filedialog.askdirectory(parent=window, initialdir=str(Path.home())) or path_var.get()
-            ),
-            bg=BG,
-            fg=FG,
-            activebackground=BG,
-            activeforeground=FG,
-            bd=0,
-            padx=10,
-            pady=0,
-            font=("Segoe UI", 9),
-            highlightthickness=1,
-            highlightbackground=BORDER,
-            relief="flat",
-            cursor="hand2",
-        ).pack(side="left", padx=(8, 0))
+    def _show_hover_popup(self, rect: platform.Rect) -> None:
+        with self._lock:
+            data = self._data
+        try:
+            self._hover_popup = ui.show_hover_popup(
+                self._root,
+                data,
+                rect,
+                theme=self._theme,
+                existing=self._hover_popup,
+                work_area=platform.work_area_bounds(),
+            )
+        except Exception:
+            # A popup that cannot be built must not leave the user hovering
+            # over an icon that says nothing at all -- `title` is currently
+            # empty precisely because this window was supposed to work.
+            log.exception("could not build the hover popup")
+            self._fall_back_to_native_tooltip("the hover popup could not be built")
 
-        helpers = tk.Frame(form, bg=PANEL)
-        helpers.pack(fill="x", pady=(8, 0))
-
-        tk.Button(
-            helpers,
-            text="Usar el perfil actual",
-            command=lambda: path_var.set(str(self._suggested_claude_dir())),
-            bg=PANEL,
-            fg=MUTED,
-            activebackground=PANEL,
-            activeforeground=FG,
-            bd=0,
-            padx=8,
-            pady=4,
-            font=("Segoe UI", 8),
-            highlightthickness=1,
-            highlightbackground=BORDER,
-            relief="flat",
-            cursor="hand2",
-        ).pack(side="left")
-
-        tk.Button(
-            helpers,
-            text="Abrir carpeta",
-            command=lambda: self._open_in_explorer(self._suggested_claude_dir()),
-            bg=PANEL,
-            fg=MUTED,
-            activebackground=PANEL,
-            activeforeground=FG,
-            bd=0,
-            padx=8,
-            pady=4,
-            font=("Segoe UI", 8),
-            highlightthickness=1,
-            highlightbackground=BORDER,
-            relief="flat",
-            cursor="hand2",
-        ).pack(side="left", padx=(8, 0))
-
-        actions = tk.Frame(form, bg=PANEL)
-        actions.pack(fill="x", pady=(12, 0))
-
-        def submit() -> None:
-            if self._prompt_add_profile(name_var.get(), path_var.get()):
-                name_var.set("")
-                path_var.set("")
-                self._show_profiles_window()
-
-        tk.Button(
-            actions,
-            text="Agregar",
-            command=submit,
-            bg=ACCENT,
-            fg=FG,
-            activebackground=ACCENT,
-            activeforeground=FG,
-            bd=0,
-            padx=12,
-            pady=6,
-            font=("Segoe UI", 9, "bold"),
-            highlightthickness=0,
-            relief="flat",
-            cursor="hand2",
-        ).pack(side="left")
-
-        tk.Button(
-            actions,
-            text="Cerrar",
-            command=window.destroy,
-            bg=PANEL,
-            fg=MUTED,
-            activebackground=PANEL,
-            activeforeground=FG,
-            bd=0,
-            padx=8,
-            pady=6,
-            font=("Segoe UI", 9),
-            highlightthickness=0,
-            relief="flat",
-            cursor="hand2",
-        ).pack(side="right")
-
-        window.update_idletasks()
-        width = window.winfo_width()
-        height = window.winfo_height()
-        x = max(40, (window.winfo_screenwidth() - width) // 2)
-        y = max(40, (window.winfo_screenheight() - height) // 3)
-        window.geometry(f"{width}x{height}+{x}+{y}")
-        window.focus_force()
-
-    def _poll_loop(self) -> None:
-        while not self._stop.wait(POLL_SECONDS):
-            self._fetch_and_update()
-
-    def _on_refresh(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        threading.Thread(
-            target=lambda: self._set_data(fetch_usage_bundle(self._profiles, force=True)),
-            daemon=True,
-        ).start()
-
-    def _on_manage_profiles(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        self._run_on_ui(self._show_profiles_window)
-
-    def _on_toggle_startup(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        _set_startup_enabled(not _is_startup_enabled())
-        icon.update_menu()
-
-    def _on_show(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        def work() -> None:
-            data = self._fetch_and_update()
-            self._run_on_ui(lambda: self._show_popup(data))
-
-        threading.Thread(target=work, daemon=True).start()
+    def _hide_hover_popup(self) -> None:
+        popup, self._hover_popup = self._hover_popup, None
+        try:
+            ui.hide_hover_popup(popup)
+        except Exception:
+            log.exception("could not hide the hover popup")
 
     def _show_popup(self, data: dict[str, Any]) -> None:
-        if self._popup and self._popup.winfo_exists():
-            self._popup.destroy()
-
-        popup = tk.Toplevel(self._root)
-        popup.title(WINDOW_TITLE)
-        popup.configure(bg=BG)
-        popup.resizable(False, False)
-        popup.attributes("-topmost", True)
-        popup.overrideredirect(True)
-        self._apply_window_icon(popup)
-        self._popup = popup
-
-        shell = tk.Frame(popup, bg=BORDER, padx=1, pady=1)
-        shell.pack(fill="both", expand=True)
-
-        frame = tk.Frame(shell, bg=PANEL, padx=12, pady=12)
-        frame.pack(fill="both", expand=True)
-
-        header = tk.Frame(frame, bg=PANEL)
-        header.pack(fill="x")
-
-        tk.Label(
-            header,
-            text="Uso del plan Max (5x)",
-            bg=PANEL,
-            fg=FG,
-            font=("Segoe UI", 10, "bold"),
-            anchor="w",
-        ).pack(side="left")
-
-        tk.Button(
-            header,
-            text="×",
-            command=popup.destroy,
-            bg=PANEL,
-            fg=MUTED,
-            activebackground=PANEL,
-            activeforeground=FG,
-            bd=0,
-            padx=4,
-            pady=0,
-            font=("Segoe UI", 11, "bold"),
-            highlightthickness=0,
-            relief="flat",
-            cursor="hand2",
-        ).pack(side="right")
-
-        profiles = data.get("profiles")
-        if isinstance(profiles, list) and profiles:
-            for index, item in enumerate(profiles):
-                profile = item.get("profile")
-                profile_data = item.get("data", {})
-                title = profile.name if isinstance(profile, ClaudeProfile) else f"Perfil {index + 1}"
-                self._render_profile_section(frame, title, profile_data, top_pad=10 if index == 0 else 12)
-        else:
-            self._render_profile_section(frame, default_profile().name, data.get("primary", data), top_pad=10)
-
-        footer = tk.Frame(frame, bg=PANEL)
-        footer.pack(fill="x", pady=(12, 0))
-
-        tk.Label(
-            footer,
-            text=_updated_text(self._updated_at),
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 9),
-            anchor="w",
-        ).pack(side="left")
-
-        tk.Button(
-            footer,
-            text="Perfiles",
-            command=self._show_profiles_window,
-            bg=PANEL,
-            fg=MUTED,
-            activebackground=PANEL,
-            activeforeground=FG,
-            bd=0,
-            padx=4,
-            pady=0,
-            font=("Segoe UI", 9),
-            highlightthickness=0,
-            relief="flat",
-            cursor="hand2",
-        ).pack(side="right", padx=(0, 10))
-
-        tk.Button(
-            footer,
-            text="↻",
-            command=lambda: threading.Thread(target=self._refresh_popup, daemon=True).start(),
-            bg=PANEL,
-            fg=MUTED,
-            activebackground=PANEL,
-            activeforeground=FG,
-            bd=0,
-            padx=4,
-            pady=0,
-            font=("Segoe UI", 11, "bold"),
-            highlightthickness=0,
-            relief="flat",
-            cursor="hand2",
-        ).pack(side="right")
-
-        popup.update_idletasks()
-        w, h = popup.winfo_width(), popup.winfo_height()
-        _, _, work_right, work_bottom = _work_area_bounds()
-        if work_right == 0 and work_bottom == 0:
-            work_right = popup.winfo_screenwidth()
-            work_bottom = popup.winfo_screenheight()
-        margin_x, margin_y = 26, 12
-        x = work_right - w - margin_x
-        y = work_bottom - h - margin_y
-        popup.geometry(f"{w}x{h}+{x}+{y}")
-
-        popup.bind("<Escape>", lambda _e: popup.destroy())
-        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
-        self._bind_popup_dismiss(popup)
-        popup.focus_force()
-
-    def _bind_popup_dismiss(self, popup: tk.Toplevel) -> None:
-        def is_within(widget: tk.Misc | None, ancestor: tk.Misc) -> bool:
-            while widget is not None:
-                if widget == ancestor:
-                    return True
-                widget = widget.master
-            return False
-
-        def dismiss() -> None:
-            if popup.winfo_exists():
-                popup.destroy()
-
-        def on_focus_out(_event: tk.Event | None = None) -> None:
-            popup.after(150, check_focus)
-
-        def check_focus() -> None:
-            if not popup.winfo_exists():
-                return
-            focused = popup.focus_get()
-            if focused is None or not is_within(focused, popup):
-                dismiss()
-
-        def on_global_click(event: tk.Event) -> None:
-            if not popup.winfo_exists():
-                return
-            x1, y1 = popup.winfo_rootx(), popup.winfo_rooty()
-            x2, y2 = x1 + popup.winfo_width(), y1 + popup.winfo_height()
-            if not (x1 <= event.x_root <= x2 and y1 <= event.y_root <= y2):
-                dismiss()
-
-        def cleanup(_event: tk.Event | None = None) -> None:
-            try:
-                self._root.unbind_all("<Button-1>")
-            except tk.TclError:
-                pass
-
-        popup.bind("<FocusOut>", on_focus_out, add="+")
-        popup.bind("<Destroy>", cleanup, add="+")
-        self._root.bind_all("<Button-1>", on_global_click, add="+")
+        log.info("opening usage popup")
+        self._popup = ui.show_popup(
+            self._root,
+            data,
+            self._updated_at,
+            theme=self._theme,
+            existing=self._popup,
+            window_icon=self._window_icon,
+            dismiss_manager=self._dismiss_manager,
+            on_refresh=lambda: threading.Thread(target=self._refresh_popup, daemon=True).start(),
+            on_manage_profiles=lambda: self._show_main_window(ui.TAB_PROFILES),
+        )
 
     def _refresh_popup(self) -> None:
         data = fetch_usage_bundle(self._profiles, force=True)
         self._set_data(data)
         self._run_on_ui(lambda: self._show_popup(data))
 
+    def _poll_loop(self) -> None:
+        # A transient fetch failure must not end periodic polling for the rest
+        # of the process's life.
+        while not self._stop.wait(POLL_SECONDS):
+            try:
+                self._fetch_and_update()
+            except Exception:
+                log.exception("scheduled poll failed; continuing")
+
+    def _on_refresh(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        log.info("menu: Actualizar")
+        threading.Thread(
+            target=lambda: self._set_data(fetch_usage_bundle(self._profiles, force=True)),
+            daemon=True,
+        ).start()
+
+    def _on_manage_profiles(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        log.info("menu: Perfiles")
+        self._run_on_ui(lambda: self._show_main_window(ui.TAB_PROFILES))
+
+    def _on_settings(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        log.info("menu: Configuracion")
+        self._run_on_ui(lambda: self._show_main_window(ui.TAB_SETTINGS))
+
+    def _on_toggle_startup(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        log.info("menu: Iniciar con Windows")
+        platform.set_startup_enabled(not platform.is_startup_enabled(), paths.startup_command())
+        icon.update_menu()
+
+    def _on_show(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        log.info("menu: Ver uso")
+
+        def work() -> None:
+            data = self._fetch_and_update()
+            self._run_on_ui(lambda: self._show_popup(data))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _on_quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        log.info("menu: Salir")
         self._stop.set()
+        if self._hover_tracker is not None:
+            self._hover_tracker.stop()
         icon.stop()
         self._run_on_ui(self._root.quit)
 
+    def _on_icon_ready(self, icon: pystray.Icon) -> None:
+        """Run the first fetch once the tray icon's window actually exists.
+
+        This must not happen before `icon.run()`. pystray's win32 backend
+        assigns `_hwnd` inside `_run()`, and `Icon.notify()` sends
+        `Shell_NotifyIcon` with that handle -- which is declared `BOOL` with
+        no errcheck, so notifying too early fails *silently*. The first poll
+        is exactly when a quota is most likely to already sit above a
+        threshold, and the alert state machine would record that tier as
+        notified while the toast went nowhere: a permanently missed alert,
+        not a delayed one. pystray's setup thread blocks on an internal queue
+        until `_mark_ready()`, which the backend calls only after the window
+        is created, so this callback is race-free by construction.
+
+        `visible` must be set explicitly: pystray only does it for you in its
+        own default setup, which passing this callback replaces.
+        """
+        icon.visible = True
+        try:
+            self._start_hover_tracking()
+        except Exception:
+            # Same contract as the fetch below: hover is an enhancement, and
+            # losing it must never cost the user the tray icon itself. The
+            # native tooltip is still set, because `_native_tooltip` only
+            # flips once the promotion has fully succeeded.
+            log.exception("could not start hover tracking; keeping the native tooltip")
+        try:
+            self._fetch_and_update()
+        except Exception:
+            # A failed first fetch must not stop the tray from appearing --
+            # without the menu there is no way to reach Perfiles and fix a
+            # bad config dir.
+            log.exception("initial fetch failed; continuing")
+
     def run(self) -> None:
-        self._fetch_and_update()
+        log.info("starting tray app")
         threading.Thread(target=self._poll_loop, daemon=True).start()
-        threading.Thread(target=self._icon.run, daemon=True).start()
+        threading.Thread(
+            target=lambda: self._icon.run(setup=self._on_icon_ready), daemon=True
+        ).start()
+        log.info("entering mainloop")
         self._root.mainloop()
+        log.info("mainloop exited")
 
 
 def main() -> None:
-    UsageTrayApp().run()
+    logging_setup.setup()
+    # Declare our app identity before the tray icon exists, so Windows can
+    # attribute toasts to it. A no-op off Windows; guarded because a cosmetic
+    # attribution must never block startup.
+    try:
+        platform.set_app_user_model_id(APP_USER_MODEL_ID)
+    except Exception:
+        log.exception("could not set AppUserModelID; continuing")
+    try:
+        UsageTrayApp().run()
+    except Exception:
+        # Startup failures happen before any window exists, so there is
+        # nothing to show a dialog on -- the log is the only record.
+        log.exception("fatal error during startup")
+        raise
