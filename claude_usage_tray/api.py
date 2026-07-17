@@ -14,7 +14,8 @@ from typing import Any
 
 import requests
 
-from .config import ClaudeProfile, default_profile
+from . import platform
+from .config import ClaudeProfile, seed_profile
 
 API_URL_USAGE = "https://api.anthropic.com/api/oauth/usage"
 MIN_FETCH_INTERVAL_SECONDS = 45
@@ -58,7 +59,7 @@ def _cli_version() -> str:
             capture_output=True,
             text=True,
             timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=platform.subprocess_flags(),
         )
         match = re.match(r"(\d+\.\d+\.\d+)", proc.stdout.strip())
         return match.group(1) if match else FALLBACK_USER_AGENT.removeprefix("claude-code/")
@@ -85,8 +86,8 @@ def _profile_state(profile: ClaudeProfile) -> dict[str, Any]:
 
 
 def read_access_token(profile: ClaudeProfile | None = None) -> str | None:
-    profile = profile or default_profile()
-    if not profile.credentials_path.exists():
+    profile = profile or seed_profile()
+    if profile is None or not profile.credentials_path.exists():
         return None
     try:
         creds = json.loads(profile.credentials_path.read_text(encoding="utf-8"))
@@ -96,8 +97,8 @@ def read_access_token(profile: ClaudeProfile | None = None) -> str | None:
 
 
 def refresh_token(profile: ClaudeProfile | None = None) -> bool:
-    profile = profile or default_profile()
-    if not profile.supports_refresh:
+    profile = profile or seed_profile()
+    if profile is None or not profile.supports_refresh:
         return False
     cli = _claude_cli_path()
     if not cli or not cli.is_file():
@@ -108,7 +109,7 @@ def refresh_token(profile: ClaudeProfile | None = None) -> bool:
             capture_output=True,
             text=True,
             timeout=60,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=platform.subprocess_flags(),
         )
         return proc.returncode == 0
     except Exception:
@@ -348,7 +349,12 @@ def fetch_usage(
     try_refresh: bool = True,
     force: bool = False,
 ) -> dict[str, Any]:
-    profile = profile or default_profile()
+    profile = profile or seed_profile()
+    if profile is None:
+        return {
+            "error": "No se detecto ninguna carpeta de configuracion de Claude. Agrega un perfil manualmente.",
+            "auth_error": True,
+        }
     headers = _headers(profile)
     if not headers:
         return {
@@ -408,7 +414,11 @@ def fetch_usage_bundle(
     *,
     force: bool = False,
 ) -> dict[str, Any]:
-    active_profiles = profiles or [default_profile()]
+    if profiles is None:
+        fallback = seed_profile()
+        active_profiles = [fallback] if fallback is not None else []
+    else:
+        active_profiles = profiles
     items: list[dict[str, Any]] = []
     for profile in active_profiles:
         items.append({"profile": profile, "data": fetch_usage(profile, force=force)})

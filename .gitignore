@@ -10,8 +10,20 @@ build/
 dist/
 *.spec
 
+# Built executables (dist/ already covers the normal case; this catches strays)
+*.exe
+
 *.log
 .DS_Store
 Thumbs.db
 
 claude_usage_profiles.json
+
+# Local tooling scratch directories (not part of the project)
+.engram/
+.atl/
+openspec/
+
+# Editor/IDE
+.idea/
+.vscode/
