@@ -155,3 +155,25 @@ def cursor_position() -> tuple[int, int] | None:
     if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
         return None
     return point.x, point.y
+
+
+def read_secret(service: str) -> str | None:
+    # Claude Code writes its token to `.credentials.json` here; there is no
+    # credential-store read to make. Explicit, documented "nothing to find".
+    return None
+
+
+def tray_requires_host_event_loop() -> bool:
+    # pystray's win32 backend runs its own message loop on a thread, which is
+    # the arrangement `app.py` was built around.
+    return False
+
+
+def tray_anchor_edge() -> str:
+    return "bottom"
+
+
+def bind_tray_click(status_item, on_primary):
+    # pystray's win32 backend honours `default=True` on a menu item, so the
+    # primary click already reaches the right callback. Nothing to rewire.
+    return None

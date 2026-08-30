@@ -66,7 +66,10 @@ OnProfilesChanged = Callable[[list[ClaudeProfile]], None]
 OnWindowSizeChanged = Callable[[str], None]
 
 # Ask the owning window for a fresh tree: `(profiles, editing_id)`.
-OnRerender = Callable[[list[ClaudeProfile], str | None], None]
+# The `str | None` is quoted, as in `hover.py`: a type alias is an ordinary
+# assignment evaluated at import time, so `from __future__ import annotations`
+# does not defer it and the PEP 604 union is a hard error before 3.10.
+OnRerender = Callable[[list[ClaudeProfile], "str | None"], None]
 
 
 def _profile_status_text(profile: ClaudeProfile) -> str:

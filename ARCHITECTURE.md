@@ -9,8 +9,8 @@ por la que hay muchos archivos chicos en vez de un `app.py` gigante.
 
 | Capa | Módulo | Responsabilidad |
 |---|---|---|
-| 0 | `platform/` | Único lugar que sabe en qué sistema operativo corre. Registro de inicio, área de trabajo, notificaciones, hover de la bandeja, flags de subprocess. `_windows.py`, `_posix.py`, `_darwin.py` implementan la misma interfaz; `__init__.py` elige. |
-| 1 | `paths.py` | Ubicación de los archivos en disco (`%APPDATA%\ClaudeUsage\`) y de los recursos empaquetados. |
+| 0 | `platform/` | Único lugar que sabe en qué sistema operativo corre. Registro de inicio, área de trabajo, notificaciones, hover de la bandeja, flags de subprocess, lectura del almacén de credenciales del sistema y dueño del event loop de la bandeja. `_windows.py`, `_posix.py`, `_darwin.py` implementan la misma interfaz; `__init__.py` elige. |
+| 1 | `paths.py` | Ubicación de los archivos en disco (`%APPDATA%\ClaudeUsage\` en Windows, `~/Library/Application Support/ClaudeUsage/` en macOS) y de los recursos empaquetados. |
 | 1 | `jsonstore.py` | Lectura/escritura de JSON de forma atómica (temp + rename) y manejo de archivos corruptos. |
 | 1 | `theme.py` | Paletas de color (oscuro/claro) y fuentes por rol. |
 | 1 | `quotas.py` | Nombres de las ventanas de cuota (`session`, `weekly`, `weekly_fable`) y sus etiquetas. Fuente única para que el tooltip, el popup y las alertas llamen a cada cuota igual. |
@@ -43,7 +43,35 @@ lógica de dominio, integración con Windows y dos ventanas. Separarlo en capas
 con dependencias hacia abajo hace que:
 
 - La lógica testeable (config, alertas, formato, scroll) no dependa de la UI.
-- Todo lo específico de Windows viva en un solo lugar (`platform/`), lo que deja
-  el camino listo para un port a Linux sin tocar el resto.
+- Todo lo específico del sistema operativo viva en un solo lugar (`platform/`).
+  Eso es lo que hizo posible el port a macOS: las tres diferencias reales
+  (el token en el llavero en vez de un archivo, el `NSStatusItem` que exige el
+  main thread, y la barra de menú arriba en vez de la de tareas abajo) entraron
+  como funciones nuevas del seam, sin tocar la lógica de dominio ni la UI.
 - Un cambio de comportamiento tenga un hogar obvio en vez de sumar líneas a un
   archivo que ya nadie podía revisar.
+
+## macOS: quién corre el event loop
+
+La diferencia menos obvia del port, y la que no se ve en la tabla de capas.
+
+En Windows, `app.py` arranca dos loops: `pystray` corre el suyo en un thread
+daemon y `tkinter` corre el `mainloop()` en el main thread. En macOS eso no se
+puede: el icono de la barra de menú es un `NSStatusItem`, o sea un objeto de
+AppKit, y AppKit sólo admite el main thread. Peor: en un proceso hay una sola
+`NSApplication`, y bajo Aqua **Tk ya es esa aplicación** — `Tk.mainloop()` es,
+por debajo, el run loop de Cocoa.
+
+La solución es no arrancar un segundo loop. `pystray` expone `run_detached()`
+justo para integrarse con otra librería que ya tenga uno: deja el icono listo y
+vuelve, y los clics del menú los despacha el loop que ya está corriendo. El seam
+lo declara con `tray_requires_host_event_loop()`, y `app.py` elige el camino
+según esa respuesta.
+
+De ahí sale la segunda regla: cualquier cambio posterior al icono (la imagen
+nueva de cada polleo, el tooltip) también es una llamada a AppKit. Como los
+polleos ocurren en threads, `_apply_to_tray()` los reencamina por la misma
+`_ui_queue` que ya usaban los callbacks de hover. Escribir en el `NSStatusItem`
+desde otro thread no falla de entrada: corrompe o crashea más tarde, que en una
+app que repinta cada 5 minutos significa morirse de madrugada sin motivo
+aparente.

@@ -60,6 +60,15 @@ ALERT_WINDOW_LABELS = quotas.QUOTA_WINDOW_LABELS
 # tray toasts to this identity rather than to `python.exe`/`claudeusage.exe`.
 APP_USER_MODEL_ID = "Anthropic.ClaudeUsage"
 
+# What the "run at login" toggle is called, in the words each OS uses for it.
+# Windows says "startup"; macOS calls the same thing a login item, and there
+# is no Windows to start with. Branching on the seam's own exported constant
+# keeps this the one place the wording is decided -- the menu item and the log
+# line below both read it, so they can never disagree.
+STARTUP_MENU_LABEL = (
+    "Iniciar con Windows" if platform.IS_WINDOWS else "Abrir al iniciar sesion"
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -121,6 +130,11 @@ class UsageTrayApp:
         # anything we cannot confirm must leave the user with the tooltip
         # that has always worked.
         self._native_tooltip = True
+        # Strong reference to the ObjC object the platform seam installs as
+        # the status item button's target (macOS only; `None` everywhere
+        # else). AppKit targets are weak references, so dropping this would
+        # leave the button firing at a collected object.
+        self._click_target: Any = None
         self._root = tk.Tk()
         self._root.withdraw()
         # Route Tk callback exceptions into the log. Tk's default handler
@@ -143,7 +157,7 @@ class UsageTrayApp:
         if platform.startup_supported():
             menu_items.append(
                 pystray.MenuItem(
-                    "Iniciar con Windows",
+                    STARTUP_MENU_LABEL,
                     self._on_toggle_startup,
                     checked=lambda _item: platform.is_startup_enabled(),
                 )
@@ -223,19 +237,52 @@ class UsageTrayApp:
     def _run_on_ui(self, fn) -> None:
         self._ui_queue.put(fn)
 
+    def _apply_to_tray(self, *, image: Any = None, title: str | None = None) -> None:
+        """Push a new image and/or tooltip onto the tray icon, from any thread.
+
+        On Windows pystray owns a message loop of its own and takes these
+        writes from whatever thread makes them. On macOS the icon is an
+        AppKit `NSStatusItem`, and `setImage_`/`setToolTip_` off the main
+        thread is undefined behaviour -- it does not fail loudly, it corrupts
+        or crashes eventually, which for a process that repaints every poll
+        means a tray app that dies overnight for no visible reason. So there
+        the write hops onto the existing UI queue, the same one the hover
+        callbacks already use.
+
+        The caller renders the image on its own thread and passes it in:
+        `icons.tray_icon` is pure Pillow and has no reason to occupy the main
+        thread, and keeping the queued task down to two attribute writes is
+        what stops a slow repaint from stuttering the UI.
+        """
+
+        def apply() -> None:
+            if image is not None:
+                self._icon.icon = image
+            if title is not None:
+                self._icon.title = title
+
+        if (
+            not platform.tray_requires_host_event_loop()
+            or threading.current_thread() is threading.main_thread()
+        ):
+            apply()
+        else:
+            self._run_on_ui(apply)
+
     def _set_data(self, data: dict[str, Any]) -> None:
         primary = data.get("primary", data)
         with self._lock:
             self._data = data
             fetched_at = formatting.parse_meta_datetime(primary.get("meta", {}).get("fetched_at"))
             self._updated_at = fetched_at or datetime.now()
-        self._icon.icon = icons.tray_icon(data, self._theme.palette)
-        if self._native_tooltip:
-            # In custom-popup mode `title` is left empty and stays that way:
-            # a non-empty `szTip` makes the shell draw its own tooltip, which
-            # would sit next to ours saying the same thing. The popup reads
-            # `self._data` when it opens, so it needs no push here.
-            self._icon.title = formatting.tooltip(data)
+        # In custom-popup mode `title` is left empty and stays that way: a
+        # non-empty `szTip` makes the shell draw its own tooltip, which would
+        # sit next to ours saying the same thing. The popup reads
+        # `self._data` when it opens, so it needs no push here.
+        self._apply_to_tray(
+            image=icons.tray_icon(data, self._theme.palette),
+            title=formatting.tooltip(data) if self._native_tooltip else None,
+        )
         self._process_alerts(data)
 
     def _process_alerts(self, data: dict[str, Any]) -> None:
@@ -400,7 +447,7 @@ class UsageTrayApp:
         apply_window_icon(self._root, self._window_icon)
         with self._lock:
             data = self._data
-        self._icon.icon = icons.tray_icon(data, self._theme.palette)
+        self._apply_to_tray(image=icons.tray_icon(data, self._theme.palette))
 
         # Re-show in the new theme, on whatever tab the user is looking at.
         # This is the settings tab's rerender: it cannot do its own, because
@@ -485,7 +532,7 @@ class UsageTrayApp:
             return
 
         self._native_tooltip = False
-        self._icon.title = ""
+        self._apply_to_tray(title="")
         self._hover_tracker = ui.HoverTracker(
             rect_of=lambda: platform.tray_icon_rect(hwnd, TRAY_ICON_UID),
             cursor_of=platform.cursor_position,
@@ -520,7 +567,7 @@ class UsageTrayApp:
         self._hide_hover_popup()
         with self._lock:
             data = self._data
-        self._icon.title = formatting.tooltip(data)
+        self._apply_to_tray(title=formatting.tooltip(data))
 
     def _show_hover_popup(self, rect: platform.Rect) -> None:
         with self._lock:
@@ -592,7 +639,7 @@ class UsageTrayApp:
         self._run_on_ui(lambda: self._show_main_window(ui.TAB_SETTINGS))
 
     def _on_toggle_startup(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        log.info("menu: Iniciar con Windows")
+        log.info("menu: %s", STARTUP_MENU_LABEL)
         platform.set_startup_enabled(not platform.is_startup_enabled(), paths.startup_command())
         icon.update_menu()
 
@@ -613,6 +660,34 @@ class UsageTrayApp:
         icon.stop()
         self._run_on_ui(self._root.quit)
 
+    def _bind_primary_click(self) -> None:
+        """Ask the platform to send a plain click straight to "Ver uso".
+
+        On Windows this is a no-op -- the menu item's `default=True` already
+        does it. On macOS it is the difference between the icon being useful
+        and the icon only ever opening a menu, because AppKit gives every
+        click to an attached `NSMenu` and never calls the button's action.
+
+        `_status_item` is pystray's private attribute, discovered rather than
+        published -- the same bargain `_hwnd` strikes for the hover popup, and
+        handled the same way: failure costs the shortcut, never the icon. The
+        seam leaves the menu attached if it cannot rewire, so the fallback is
+        the perfectly usable "click opens the menu, pick Ver uso".
+        """
+        status_item = getattr(self._icon, "_status_item", None)
+        if status_item is None:
+            return
+        try:
+            self._click_target = platform.bind_tray_click(
+                status_item,
+                lambda: self._on_show(self._icon, None),
+            )
+        except Exception:
+            log.exception("could not bind the primary click; the menu still opens on click")
+            return
+        if self._click_target is not None:
+            log.info("primary click opens the usage popup; secondary opens the menu")
+
     def _on_icon_ready(self, icon: pystray.Icon) -> None:
         """Run the first fetch once the tray icon's window actually exists.
 
@@ -631,6 +706,11 @@ class UsageTrayApp:
         own default setup, which passing this callback replaces.
         """
         icon.visible = True
+        # AppKit work, so it has to land on the main thread -- this callback
+        # runs on pystray's setup thread. Queued rather than called: by the
+        # time the queue drains, `icon.run_detached()` has long since built
+        # the menu this rewiring needs to find.
+        self._run_on_ui(self._bind_primary_click)
         try:
             self._start_hover_tracking()
         except Exception:
@@ -650,9 +730,28 @@ class UsageTrayApp:
     def run(self) -> None:
         log.info("starting tray app")
         threading.Thread(target=self._poll_loop, daemon=True).start()
-        threading.Thread(
-            target=lambda: self._icon.run(setup=self._on_icon_ready), daemon=True
-        ).start()
+        if platform.tray_requires_host_event_loop():
+            # macOS: there is exactly one NSApplication run loop in the
+            # process, and `Tk.mainloop()` below is already it -- Aqua Tk is
+            # a Cocoa app. `run()` would try to start a second one on a
+            # background thread, which is both wrong (AppKit is main-thread
+            # only) and pointless. `run_detached()` is pystray's supported
+            # answer: it readies the icon and returns, leaving the clicks to
+            # be dispatched by whatever loop the host toolkit runs.
+            #
+            # `visible` is set here rather than left to the setup callback:
+            # the callback runs on a worker thread, and showing the status
+            # item is an AppKit call. Doing it on this thread, before the
+            # loop starts, is both safe and one less thing for `_on_icon_ready`
+            # to get wrong. The setter is idempotent, so the callback's own
+            # assignment becomes a no-op.
+            self._icon.visible = True
+            self._icon.run_detached(setup=self._on_icon_ready)
+            log.info("tray icon attached to the host event loop (run_detached)")
+        else:
+            threading.Thread(
+                target=lambda: self._icon.run(setup=self._on_icon_ready), daemon=True
+            ).start()
         log.info("entering mainloop")
         self._root.mainloop()
         log.info("mainloop exited")

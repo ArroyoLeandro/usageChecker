@@ -35,6 +35,20 @@ class ClaudeProfile:
         return self.config_dir / ".credentials.json"
 
     @property
+    def is_ambient_default(self) -> bool:
+        """Whether this profile points at the machine's own Claude directory
+        (as opposed to a second account, a copy, or a mounted WSL path).
+
+        The condition `supports_refresh` has always tested, given its own
+        name because a second caller now needs it for an unrelated reason:
+        on macOS the credentials live in a Keychain entry that belongs to
+        whichever account Claude Code itself is logged into, so only the
+        ambient default profile may read it. Two callers asking the same
+        question through one property beats two copies of `_paths_equal`.
+        """
+        return _paths_equal(self.config_dir, default_claude_dir())
+
+    @property
     def supports_refresh(self) -> bool:
         """Derived, never stored. True iff `config_dir` is the ambient
         default Claude directory -- see profile-management spec,
@@ -44,7 +58,7 @@ class ClaudeProfile:
         could never change, which made the hardcode tautologically safe.
         Editable paths (this slice's feature) make that assumption false.
         """
-        return _paths_equal(self.config_dir, default_claude_dir())
+        return self.is_ambient_default
 
 
 @dataclass(frozen=True)

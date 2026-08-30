@@ -257,13 +257,22 @@ def show_popup(
     w, h = popup.winfo_width(), popup.winfo_height()
     work_area = platform.work_area_bounds()
     if work_area is None:
+        work_top = 0
         work_right = popup.winfo_screenwidth()
         work_bottom = popup.winfo_screenheight()
     else:
+        work_top = work_area.top
         work_right, work_bottom = work_area.right, work_area.bottom
     margin_x, margin_y = 26, 12
     x = work_right - w - margin_x
-    y = work_bottom - h - margin_y
+    # Hang the popup off whichever edge the tray icon actually lives on:
+    # under the menu bar on macOS, above the taskbar on Windows and Linux.
+    # Anchoring at the bottom everywhere would, on a Mac, drop the popup at
+    # the far corner from the icon that opened it -- and on top of the Dock.
+    if platform.tray_anchor_edge() == platform.TRAY_ANCHOR_TOP:
+        y = work_top + margin_y
+    else:
+        y = work_bottom - h - margin_y
     popup.geometry(f"{w}x{h}+{x}+{y}")
 
     popup.bind("<Escape>", lambda _e: popup.destroy())

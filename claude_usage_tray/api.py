@@ -22,6 +22,10 @@ MIN_FETCH_INTERVAL_SECONDS = 45
 BACKOFF_BASE_SECONDS = 60
 BACKOFF_MAX_SECONDS = 30 * 60
 FALLBACK_USER_AGENT = "claude-code/2.1.201"
+#: The Keychain service name Claude Code stores its credentials JSON under on
+#: macOS. Fixed by Claude Code, not by us -- it takes no config-dir suffix,
+#: which is why only the ambient default profile can read it.
+KEYCHAIN_SERVICE = "Claude Code-credentials"
 _STATE_LOCK = threading.Lock()
 _STATE_BY_PROFILE: dict[str, dict[str, Any]] = {}
 
@@ -85,15 +89,45 @@ def _profile_state(profile: ClaudeProfile) -> dict[str, Any]:
         )
 
 
+def _read_credentials_blob(profile: ClaudeProfile) -> str | None:
+    """The raw credentials JSON for `profile`, from wherever this OS keeps it.
+
+    The file comes first and always wins: it is per-profile, so a user who
+    points a profile at a copied `.claude` directory gets that profile's
+    token, and a WSL directory mounted on a Mac keeps working.
+
+    The Keychain is the fallback, and only for the ambient default profile.
+    Claude Code on macOS writes no `.credentials.json` at all -- the blob
+    lives in the login Keychain under a single, fixed service name, with no
+    room for a config-dir qualifier. So it can only answer for the one
+    profile that *is* the ambient default; letting any other profile fall
+    back to it would make every macOS profile silently report the default
+    account's usage, which is worse than reporting no session at all.
+    """
+    try:
+        if profile.credentials_path.exists():
+            return profile.credentials_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if profile.is_ambient_default:
+        return platform.read_secret(KEYCHAIN_SERVICE)
+    return None
+
+
 def read_access_token(profile: ClaudeProfile | None = None) -> str | None:
     profile = profile or seed_profile()
-    if profile is None or not profile.credentials_path.exists():
+    if profile is None:
+        return None
+    blob = _read_credentials_blob(profile)
+    if not blob:
         return None
     try:
-        creds = json.loads(profile.credentials_path.read_text(encoding="utf-8"))
-        return creds.get("claudeAiOauth", {}).get("accessToken") or None
-    except (json.JSONDecodeError, OSError):
+        creds = json.loads(blob)
+    except json.JSONDecodeError:
         return None
+    if not isinstance(creds, dict):
+        return None
+    return creds.get("claudeAiOauth", {}).get("accessToken") or None
 
 
 def refresh_token(profile: ClaudeProfile | None = None) -> bool:

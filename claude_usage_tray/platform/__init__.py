@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 from ._types import FileManagerError, PlatformUnsupportedError, Rect, WorkArea
 
@@ -53,7 +54,20 @@ __all__ = [
     "tray_hover_supported",
     "tray_icon_rect",
     "cursor_position",
+    "read_secret",
+    "tray_requires_host_event_loop",
+    "tray_anchor_edge",
+    "bind_tray_click",
+    "TRAY_ANCHOR_TOP",
+    "TRAY_ANCHOR_BOTTOM",
 ]
+
+#: The screen edge the tray/menu-bar icon lives on. Windows and Linux put it
+#: at the bottom (taskbar/system tray); macOS puts it at the top (menu bar).
+#: Named constants rather than bare strings so a typo is an AttributeError at
+#: import time instead of a window that silently opens on the wrong edge.
+TRAY_ANCHOR_TOP = "top"
+TRAY_ANCHOR_BOTTOM = "bottom"
 
 
 def set_app_user_model_id(app_id: str) -> None:
@@ -132,3 +146,71 @@ def cursor_position() -> tuple[int, int] | None:
     """Return the cursor's `(x, y)` in the same coordinate space
     `tray_icon_rect` reports, or `None` where it cannot be known."""
     return _backend.cursor_position()
+
+
+def read_secret(service: str) -> str | None:
+    """Read `service` from the OS credential store, or `None`.
+
+    An "I don't know" everywhere the platform has no such store (Windows and
+    Linux here), and equally `None` when the store exists but holds no entry
+    under that name -- the caller cannot act differently on those two cases,
+    so they are not distinguished. Never raises: a missing secret is an
+    ordinary state (the user is simply not logged in yet), not a fault.
+
+    Exists because Claude Code does not store its OAuth token the same way on
+    every platform: on Windows and Linux it writes `.credentials.json` inside
+    the config dir, while on macOS it puts the same JSON blob in the login
+    Keychain and leaves no file behind. Reading a file is not an OS fact and
+    stays in `api.py`; reaching into a *platform credential store* is, and
+    belongs here.
+    """
+    return _backend.read_secret(service)
+
+
+def tray_requires_host_event_loop() -> bool:
+    """Whether the tray icon must be serviced by the GUI toolkit's own event
+    loop instead of one pystray runs on a thread of its own.
+
+    `True` on macOS: an `NSStatusItem` is an AppKit object, so it must be
+    created and updated on the main thread, and its clicks are dispatched by
+    the process's single `NSApplication` run loop -- which, under Aqua Tk, is
+    the loop `Tk.mainloop()` is already running. The caller answers this by
+    using pystray's `run_detached()` (which readies the icon without starting
+    a second loop) rather than `run()` on a background thread, and by hopping
+    every later mutation of the icon back onto the main thread.
+
+    `False` on Windows and Linux, where pystray owns a message loop of its own
+    and driving it from a background thread is the supported arrangement.
+    """
+    return _backend.tray_requires_host_event_loop()
+
+
+def tray_anchor_edge() -> str:
+    """The screen edge the tray icon sits on: `TRAY_ANCHOR_TOP` or
+    `TRAY_ANCHOR_BOTTOM`.
+
+    A window that means to appear *near the tray icon* has to know which end
+    of the work area to measure from. Every other platform here anchors at
+    the bottom, next to a taskbar; macOS anchors at the top, under the menu
+    bar. Returned as an edge rather than a coordinate because the caller also
+    needs the window's own measured height to place it, and that is a Tk fact
+    this seam has no business knowing.
+    """
+    return _backend.tray_anchor_edge()
+
+
+def bind_tray_click(status_item: Any, on_primary: Callable[[], None]) -> Any | None:
+    """Make a primary click on the tray icon invoke `on_primary` directly.
+
+    Windows gets this for free: pystray's backend honours the `default=True`
+    menu item, so a left click already runs it and this is an explicit no-op
+    returning `None`. macOS does not -- an `NSStatusItem` with a menu attached
+    hands every click to the menu -- so there the backend rewires the button
+    and re-presents the menu on secondary clicks instead.
+
+    Returns an opaque token that the caller must hold a reference to for as
+    long as the icon lives, or `None` when nothing was rewired. `None` is not
+    a failure to handle: it means the platform's own default-action handling
+    is in force, which is the correct behaviour there.
+    """
+    return _backend.bind_tray_click(status_item, on_primary)

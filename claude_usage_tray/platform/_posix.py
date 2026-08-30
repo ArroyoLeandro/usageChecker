@@ -62,3 +62,22 @@ def tray_icon_rect(hwnd: int, uid: int) -> Rect | None:
 
 def cursor_position() -> tuple[int, int] | None:
     return None
+
+
+def read_secret(service: str) -> str | None:
+    # No credential store this app targets: Claude Code writes
+    # `.credentials.json` on Linux, same as Windows.
+    return None
+
+
+def tray_requires_host_event_loop() -> bool:
+    return False
+
+
+def tray_anchor_edge() -> str:
+    return "bottom"
+
+
+def bind_tray_click(status_item, on_primary):
+    # Same as Windows: the backend's own default-item handling applies.
+    return None
