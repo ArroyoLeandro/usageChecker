@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "claude-usage": {
+      "command": "python3",
+      "args": ["-m", "claude_usage_tray.mcp_server"],
+      "env": {
+        "PYTHONPATH": "."
+      }
+    }
+  }
+}

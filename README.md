@@ -102,6 +102,180 @@ va a mostrar "sin sesión" salvo que esa carpeta tenga su propio
 la alternativa sería mostrar el uso de tu cuenta principal con el nombre de otro
 perfil.
 
+## Servidor MCP: que un agente consulte el uso
+
+Además de la bandeja, el proyecto expone el mismo dato como un **servidor MCP**,
+para que un agente (Claude Code, por ejemplo) pueda preguntar cuánta cuota queda
+antes de arrancar un trabajo largo o entre vueltas de un loop programado.
+
+No necesita Windows, ni la app corriendo, ni instalar nada: es stdlib pura sobre
+`requests`, que ya está en `requirements.txt`.
+
+### Registrarlo
+
+```bash
+claude mcp add claude-usage --scope user \
+  -e PYTHONPATH=/ruta/a/usageChecker \
+  -- python3 -m claude_usage_tray.mcp_server
+```
+
+Con `--scope user` queda disponible en cualquier proyecto. Para usarlo sólo
+dentro de este repo alcanza con el `.mcp.json` que ya viene versionado.
+Verificalo con `claude mcp list`; se saca con `claude mcp remove claude-usage`.
+
+### El tool
+
+`get_claude_usage(config_dir?, force_refresh?)` devuelve, en un solo llamado:
+
+- las tres ventanas de cuota (5 horas, 7 días, Fable) con el porcentaje usado,
+  el restante, y cuánto falta para que se reinicien;
+- `highest_used_percent`: el más alto de todos, que es **el que manda** — la
+  cuota se agota cuando se llena cualquiera, no sólo la de 5 horas;
+- `other_limits`: los cortes por modelo que trae la cuenta (Opus, Sonnet, etc.);
+- `summary`: una línea del estilo `5h 25% · 7d 66%`.
+
+### Qué cuenta consulta
+
+Por defecto, **la del Claude que lo lanzó**. Claude Code exporta
+`CLAUDE_CONFIG_DIR` y los servidores que arranca lo heredan, así que un Claude
+corriendo sobre `~/.claude-personal` recibe el uso de esa cuenta sin
+configuración alguna. El orden completo, de más específico a menos:
+
+1. el argumento `config_dir` del tool — para preguntar por otra cuenta;
+2. `CLAUDE_USAGE_CONFIG_DIR` en la entrada del servidor — para fijarlo a mano;
+3. `CLAUDE_CONFIG_DIR` — el Claude que llama;
+4. `~/.claude`.
+
+Cada respuesta incluye qué carpeta se usó y por cuál de esas reglas, así que una
+cuenta equivocada se diagnostica leyendo el resultado.
+
+### Informa, no frena
+
+El servidor puede decir que la cuota semanal va 91%; **no puede impedir que el
+agente siga**. Nada de lo que devuelve un tool MCP es vinculante: el modelo lo
+lee y decide. Para un corte que el modelo no pueda ignorar está el techo de uso,
+abajo.
+
+## Techo de uso: frenar al agente automáticamente
+
+El caso de uso: dejar un agente trabajando de noche sin que se coma la cuota de
+toda la semana. Para eso hacen falta **dos** números, no uno. Un corte seco al
+70% frena al agente en la mitad de una edición, con el trabajo sin guardar — un
+resultado peor que el gasto que evitó. Así que un presupuesto es un **techo**
+más un **margen de aviso**: al entrar en el margen se le dice al agente que
+cierre y guarde, mientras todavía le queda cuota para hacerlo.
+
+```
+        65%                    70%
+   ──────┼──────────────────────┼──────────►
+         │                      │
+      aviso:                 techo:
+   "cerrá y guardá"      turno rechazado
+```
+
+### Configurarlo
+
+Desde cualquier sesión:
+
+```
+/usage-budget 70          # techo 70%, aviso desde 65%
+/usage-budget 70 10       # techo 70%, aviso desde 60%
+/usage-budget status      # dónde estás parado
+/usage-budget off         # sin techo
+```
+
+En criollo también funciona ("no pases del 70% esta noche"): el agente llama al
+tool `set_usage_budget`.
+
+### Alcance: la sesión donde lo pusiste, y sus subagentes
+
+El techo vale para **esa** sesión de Claude y para los subagentes que lance —
+no para todo Claude. Las otras terminales que tengas abiertas siguen igual.
+
+Funciona porque Claude Code exporta `CLAUDE_CODE_SESSION_ID` a todo proceso que
+arranca, y un subagente hereda el del padre. Escritor (el tool MCP) y lector (el
+hook) ven el mismo valor, así que "este agente y todo lo que él levantó" es
+exactamente una clave. Cada sesión guarda su techo en su propio archivo dentro
+de `budgets/`, así que dos sesiones fijando techo al mismo tiempo no se pisan.
+
+El precio, que conviene tener claro: con tres sesiones abiertas se pueden gastar
+tres techos entre todas. El techo acota al agente que apuntaste, no a la cuenta.
+Si lo que querés es acotar la cuenta entera, hay que poner el mismo techo en
+cada sesión.
+
+### Instalarlo
+
+El techo lo aplica un hook, que se declara en `settings.json` (`~/.claude/`
+para todos los proyectos, o `.claude/` para uno solo). Los dos eventos hacen
+falta:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "timeout": 15,
+                    "command": "env PYTHONPATH=/ruta/a/usageChecker python3 -m claude_usage_tray.hooks" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "timeout": 15,
+                    "command": "env PYTHONPATH=/ruta/a/usageChecker python3 -m claude_usage_tray.hooks" }] }
+    ]
+  }
+}
+```
+
+`UserPromptSubmit` corta entre turnos — incluida cada vuelta de un `/loop`.
+`PreToolUse` corta *dentro* de un turno largo, que es donde el otro no vuelve a
+dispararse hasta que termine.
+
+### Sacar el techo y volver a arrancar
+
+Si **todavía no** te bloqueó, alcanza con:
+
+```
+/usage-budget off        # o "subime el techo a 85"
+```
+
+Si **ya** te bloqueó, usá el comando dedicado:
+
+```
+/usage-override off      # o /usage-override 93 para subirlo
+```
+
+El gate matchea la cadena pelada `usage-override`, y el nombre del comando ya
+la contiene, así que invocarlo *es* la escotilla. También funciona suelta en
+cualquier parte de un mensaje común: `subime el techo a 93 usage-override`.
+
+**No lleva `!` adelante.** Claude Code lee un `!` inicial como su prefijo de
+shell, así que `!usage-override ...` se lo comía bash y nunca llegaba a ser
+texto de prompt — justo la posición más natural era la única que no podía
+funcionar.
+
+La escotilla deja pasar ese turno sin tocar la red. Y `set_usage_budget`
+está exento del gate de forma permanente: si el tool que levanta el techo
+quedara detrás del techo, no habría vuelta desde adentro de la sesión.
+
+Desde afuera de Claude siempre funciona borrar el archivo:
+
+```bash
+rm ~/.config/ClaudeUsage/budgets/<session-id>.json   # %APPDATA%\ClaudeUsage\budgets\ en Windows
+```
+
+Esa exención es también la única vía por la que un agente podría levantarse el
+techo a sí mismo, así que el mensaje de bloqueo le dice explícitamente que no lo
+haga y que sólo vos podés cambiarlo. Es una instrucción, no una barrera: si
+querés un techo que ni el agente coopere en levantar, sacá `set_usage_budget`
+del servidor MCP y manejá el archivo sólo desde la terminal.
+
+### Falla abierto, siempre
+
+Sin presupuesto configurado, con uso desconocido, con la API caída, con el
+archivo corrupto o con una excepción adentro del hook: **te deja pasar**. Un
+gate que falla cerrado te deja afuera de la sesión que necesitarías para
+desbloquearlo, hasta que resetee la cuota horas después. Gastar de más se
+recupera; no poder escribir, no.
+
+
 ## Dónde se guardan los datos
 
 En Windows, todo vive en `%APPDATA%\ClaudeUsage\` (normalmente
@@ -110,6 +284,8 @@ En Windows, todo vive en `%APPDATA%\ClaudeUsage\` (normalmente
 
 - `config.json` — perfiles y preferencias (tema, colores, alertas). Es por computadora: cualquier ejecución de la app lee y escribe este mismo archivo.
 - `alert-state.json` — estado interno de las alertas (qué se notificó y cuándo). Se puede borrar sin perder configuración.
+- `budgets/<session-id>.json` — el techo de cada sesión que fijó uno. Borrar el archivo equivale a `/usage-budget off` en esa sesión. Los que quedan de sesiones muertas se barren solos a los 7 días.
+- `usage-cache-<cuenta>.json` — la última cifra de uso que leyó el hook, una por cuenta. Machine-written y descartable: sin esto, el hook haría una llamada a la API antes de cada prompt y de cada tool.
 - `claude-usage.log` — registro de diagnóstico. Si algo falla, el error queda acá (la app se compila sin consola, así que este archivo es la forma de ver qué pasó).
 
 ## Diferencias entre plataformas
@@ -126,3 +302,4 @@ El tooltip propio es el único recorte real: depende de poder preguntarle al
 sistema por el rectángulo del icono, y la barra de menú de macOS no expone nada
 equivalente. La app lo detecta y se queda con el tooltip nativo, que muestra la
 misma información.
+

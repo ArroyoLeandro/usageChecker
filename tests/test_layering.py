@@ -47,9 +47,27 @@ LAYER: dict[str, int] = {
     # it: configuring logging is the entry point's job, and every other module
     # just calls `logging.getLogger(__name__)` with no intra-package edge.
     "logging_setup": 2,
+    # Pure ceiling policy plus its store. L2 because three callers need the
+    # same answer to "which percentage binds" and two of them (`mcp_server`,
+    # `hooks`) are L5 peers forbidden from importing each other -- the same
+    # bind that put `quotas.py` at L1.
+    "budget": 2,
     "api": 3,
+    # Which Claude installation a headless consumer reports on. L3 rather
+    # than inside `mcp_server/` for the reason above; it cannot go lower
+    # because it depends on `config` (L2).
+    "accounts": 3,
     "ui": 4,
     "app": 5,
+    # Second entry point, peer to `app.py`: it composes `config` (L2) and
+    # `api` (L3) into an MCP server. Listed at 5 rather than 4 so this gate
+    # forbids an edge to `app` in *either* direction -- the tray must not
+    # grow a dependency on a background server, and the server must not need
+    # the tray's runtime to answer a question.
+    "mcp_server": 5,
+    # The enforcing half, peer to both. It may not import `mcp_server`, which
+    # is what forced `accounts` and `budget` down to shared layers.
+    "hooks": 5,
 }
 
 
