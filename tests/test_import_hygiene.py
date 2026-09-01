@@ -64,6 +64,24 @@ CLEAN_MODULES = [
     # and therefore whether switching preset still works -- is testable with
     # no colour picker to open.
     "claude_usage_tray.ui.colors",
+    # The MCP server's three non-fetching modules. `server.py` is absent
+    # from this list on purpose -- it reaches `api.py`, and therefore
+    # `requests`, which is the whole reason the rest of the package is
+    # arranged so that resolving an account, shaping a report and speaking
+    # JSON-RPC each work without it. Keeping them here is what stops a
+    # convenience import in `report.py` from quietly making the pure half of
+    # this server depend on the network half.
+    "claude_usage_tray.accounts",
+    "claude_usage_tray.mcp_server.report",
+    "claude_usage_tray.mcp_server.jsonrpc",
+    # The ceiling policy and the gate that enforces it. `requests` must stay
+    # out of both: the gate runs in front of every prompt and every tool
+    # call, so `cache.py` defers the `api` import to the cache-miss path.
+    # Listing these here is what keeps that deferral from being quietly
+    # undone by a convenience import at module scope.
+    "claude_usage_tray.budget",
+    "claude_usage_tray.hooks.cache",
+    "claude_usage_tray.hooks.gate",
 ]
 
 # Modules allowed exactly one forbidden import: PIL. `icons.py` renders
