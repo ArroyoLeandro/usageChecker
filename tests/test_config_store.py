@@ -474,7 +474,11 @@ def test_saved_config_always_carries_a_settings_key(tmp_path, monkeypatch, app_d
 
     payload = json.loads(paths.config_file().read_text(encoding="utf-8"))
 
-    assert payload["schema_version"] == 2
+    # Bumped to 3 by the multi-provider work: profiles now carry a
+    # `provider`, and `load_config` uses the stored version to decide whether
+    # to run the one-time adoption of newly-supported providers.
+    assert payload["schema_version"] == 3
+    assert payload["profiles"][0]["provider"] == "claude"
     assert payload["settings"] == {}
 
 
@@ -498,3 +502,199 @@ def test_no_fallback_to_a_second_location_on_corruption(tmp_path, monkeypatch, a
 
     result = config.load_config()
     assert result.notices and isinstance(result.notices[0], config.ConfigCorrupted)
+
+
+# ---------------------------------------------------------------------------
+# Multi-provider seeding and the SCHEMA_VERSION 3 migration
+# ---------------------------------------------------------------------------
+
+
+def _seed_provider_dirs(tmp_path, monkeypatch, *, claude=True, codex=True):
+    """Point both providers at throwaway directories, creating the ones the
+    caller wants auto-detected. Overrides the autouse `isolated_provider_dirs`
+    fixture, which points everything at paths that do not exist."""
+    dirs = {}
+    for provider_id, variable in (("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")):
+        target = tmp_path / f"ambient-{provider_id}"
+        monkeypatch.setenv(variable, str(target))
+        dirs[provider_id] = target
+    if claude:
+        dirs["claude"].mkdir(parents=True, exist_ok=True)
+    if codex:
+        dirs["codex"].mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def test_first_run_seeds_one_profile_per_installed_provider(tmp_path, monkeypatch, app_data_dir):
+    """The whole point of the multi-provider work: a user running both CLIs
+    sees both quotas without configuring anything."""
+    dirs = _seed_provider_dirs(tmp_path, monkeypatch)
+
+    result = config.load_config()
+
+    assert [p.provider for p in result.config.profiles] == ["claude", "codex"]
+    assert result.config.profiles[0].config_dir == dirs["claude"]
+    assert result.config.profiles[1].config_dir == dirs["codex"]
+
+
+def test_first_run_skips_a_provider_that_is_not_installed(tmp_path, monkeypatch, app_data_dir):
+    _seed_provider_dirs(tmp_path, monkeypatch, codex=False)
+
+    result = config.load_config()
+
+    assert [p.provider for p in result.config.profiles] == ["claude"]
+
+
+def test_seeded_profiles_are_persisted_with_their_provider(tmp_path, monkeypatch, app_data_dir):
+    _seed_provider_dirs(tmp_path, monkeypatch)
+
+    config.load_config()
+
+    payload = json.loads(paths.config_file().read_text(encoding="utf-8"))
+    assert [entry["provider"] for entry in payload["profiles"]] == ["claude", "codex"]
+
+
+def test_a_pre_provider_config_migrates_its_profiles_to_claude(tmp_path, monkeypatch, app_data_dir):
+    """A schema-2 profile has no `provider` key. It predates the field; it is
+    not corrupt, and it must not be quarantined."""
+    _seed_provider_dirs(tmp_path, monkeypatch, codex=False)
+    jsonstore.write_json_atomic(
+        paths.config_file(),
+        {
+            "schema_version": 2,
+            "profiles": [{"id": "a", "name": "Work", "config_dir": str(tmp_path / "work")}],
+            "settings": {},
+        },
+    )
+
+    result = config.load_config()
+
+    assert result.notices == []
+    assert result.config.profiles[0].provider == "claude"
+
+
+def test_upgrading_adopts_a_provider_the_old_config_could_not_know_about(
+    tmp_path, monkeypatch, app_data_dir
+):
+    """Without this, an existing user upgrading would see only their Claude
+    profile and would have to discover the feature to use it."""
+    dirs = _seed_provider_dirs(tmp_path, monkeypatch)
+    jsonstore.write_json_atomic(
+        paths.config_file(),
+        {
+            "schema_version": 2,
+            "profiles": [{"id": "a", "name": "Work", "config_dir": str(dirs["claude"])}],
+            "settings": {},
+        },
+    )
+
+    result = config.load_config()
+
+    assert [p.provider for p in result.config.profiles] == ["claude", "codex"]
+    assert result.config.profiles[0].id == "a", "the existing profile keeps its identity"
+
+
+def test_adoption_runs_once_so_a_deleted_profile_stays_deleted(tmp_path, monkeypatch, app_data_dir):
+    """Re-adopting on every launch would make an adopted row impossible to
+    remove -- the user deletes it, and it returns on the next start."""
+    _seed_provider_dirs(tmp_path, monkeypatch)
+    jsonstore.write_json_atomic(
+        paths.config_file(),
+        {
+            "schema_version": 2,
+            "profiles": [{"id": "a", "name": "Work", "config_dir": str(tmp_path / "work")}],
+            "settings": {},
+        },
+    )
+
+    adopted = config.load_config().config
+    assert len(adopted.profiles) == 2
+
+    remaining = config.delete_profile(adopted.profiles, adopted.profiles[1].id)
+    config.save_config(config.AppConfig(profiles=remaining, settings=adopted.settings))
+
+    assert [p.provider for p in config.load_config().config.profiles] == ["claude"]
+
+
+def test_adoption_does_not_duplicate_a_directory_already_added_by_hand(
+    tmp_path, monkeypatch, app_data_dir
+):
+    dirs = _seed_provider_dirs(tmp_path, monkeypatch)
+    jsonstore.write_json_atomic(
+        paths.config_file(),
+        {
+            "schema_version": 2,
+            # The user had already pointed a (mislabelled) profile at ~/.codex.
+            "profiles": [{"id": "a", "name": "Codex", "config_dir": str(dirs["codex"])}],
+            "settings": {},
+        },
+    )
+
+    result = config.load_config()
+
+    # Nothing is adopted here, and both guards are why: the existing profile
+    # already counts as the user's `claude` profile (so the ambient Claude dir
+    # is not added on top of it), and the Codex candidate's directory is
+    # already spoken for (so it is not added either). Adoption fills gaps; it
+    # does not reorganise a list the user built.
+    dirs_seen = [p.config_dir for p in result.config.profiles]
+    assert len(dirs_seen) == len(set(dirs_seen)), "no directory may appear twice"
+    assert dirs["codex"] in dirs_seen
+    assert result.config.profiles[0].id == "a"
+
+
+def test_an_unknown_provider_string_is_kept_rather_than_quarantined(tmp_path, monkeypatch, app_data_dir):
+    """An older exe opening a config written by a newer one must still run."""
+    _seed_provider_dirs(tmp_path, monkeypatch, claude=False, codex=False)
+    jsonstore.write_json_atomic(
+        paths.config_file(),
+        {
+            "schema_version": 3,
+            "profiles": [
+                {"id": "a", "name": "X", "config_dir": str(tmp_path / "x"), "provider": "opencode"}
+            ],
+            "settings": {},
+        },
+    )
+
+    result = config.load_config()
+
+    assert result.notices == []
+    assert result.config.profiles[0].provider == "opencode"
+    # Read through the registry it degrades, so the tray still polls something
+    # rather than crashing on an unknown id.
+    assert result.config.profiles[0].adapter.id == config.providers.DEFAULT_ID
+
+
+def test_credentials_path_follows_the_profile_provider(tmp_path):
+    claude = config.ClaudeProfile(id="a", name="A", config_dir=tmp_path, provider="claude")
+    codex = config.ClaudeProfile(id="b", name="B", config_dir=tmp_path, provider="codex")
+    assert claude.credentials_path.name == ".credentials.json"
+    assert codex.credentials_path.name == "auth.json"
+
+
+def test_editing_a_profile_can_change_its_provider(tmp_path):
+    profiles = [config.ClaudeProfile(id="a", name="A", config_dir=tmp_path / "a")]
+    edited = config.edit_profile(profiles, "a", provider="codex")
+    assert edited[0].provider == "codex"
+    assert edited[0].id == "a"
+
+
+def test_editing_without_naming_a_provider_leaves_it_alone(tmp_path):
+    profiles = [config.ClaudeProfile(id="a", name="A", config_dir=tmp_path / "a", provider="codex")]
+    edited = config.edit_profile(profiles, "a", name="Renamed")
+    assert edited[0].provider == "codex"
+
+
+def test_supports_refresh_is_evaluated_against_the_profiles_own_provider(
+    tmp_path, monkeypatch
+):
+    """It used to compare against the Claude directory for every profile,
+    which would have reported a Codex profile as un-refreshable even when it
+    sits in the ambient Codex folder."""
+    dirs = _seed_provider_dirs(tmp_path, monkeypatch)
+    codex = config.ClaudeProfile(id="b", name="B", config_dir=dirs["codex"], provider="codex")
+    assert codex.supports_refresh is True
+
+    elsewhere = config.ClaudeProfile(id="c", name="C", config_dir=tmp_path / "nope", provider="codex")
+    assert elsewhere.supports_refresh is False

@@ -1,12 +1,13 @@
 # Claude Usage
 
-App de Windows para ver el uso de Claude Code desde la bandeja del sistema y consultar varios perfiles de Claude desde una sola ventana.
+App de Windows para ver el uso de Claude Code y de OpenAI Codex desde la bandeja del sistema, con todas tus cuentas en una sola ventana.
 
 ## Características
 
-- **Perfiles**: agregar, editar (nombre y ruta), reordenar y eliminar cualquier perfil, incluido el detectado automáticamente.
+- **Varios servicios a la vez**: Claude Code y OpenAI Codex en la misma lista, cada uno con su cuota y su renovación. Si tenés los dos instalados, la app los detecta sola en el primer arranque.
+- **Perfiles**: agregar, editar (servicio, nombre y ruta), reordenar y eliminar cualquier perfil, incluido el detectado automáticamente.
 - **Tooltip propio**: al pasar el mouse por el icono de la bandeja aparece un resumen con los colores del tema, en lugar del tooltip gris del sistema.
-- **Popup de uso**: ventana con el uso de cada perfil por ventana de cuota (últimas 5 horas, últimos 7 días, Fable).
+- **Popup de uso**: ventana con el uso de cada perfil por ventana de cuota (últimas 5 horas, últimos 7 días, Fable). Codex reporta las dos primeras; no tiene Fable.
 - **Configuración por usuario**: tema (oscuro/claro), tamaño de letra y colores personalizados por hex.
 - **Alertas**: aviso cuando el uso cruza un umbral, configurable por perfil y por ventana de cuota, con un tiempo mínimo entre avisos.
 - **Persistencia**: toda la configuración se guarda en `%APPDATA%\ClaudeUsage\` (ver [Dónde se guardan los datos](#dónde-se-guardan-los-datos)).
@@ -17,8 +18,8 @@ Para entender cómo está organizado el código, ver [ARCHITECTURE.md](ARCHITECT
 
 - Windows.
 - Python 3 instalado para ejecutar el proyecto desde código fuente.
-- [Claude Code](https://claude.ai/download) instalado.
-- Tener sesión iniciada en Claude Code en el perfil que quieras consultar.
+- [Claude Code](https://claude.ai/download) y/o [OpenAI Codex](https://developers.openai.com/codex/) instalados. Alcanza con uno.
+- Tener sesión iniciada en el CLI del perfil que quieras consultar.
 
 ## Clonar e instalar
 
@@ -46,20 +47,37 @@ python build.py
 
 El ejecutable se genera en `dist/`. Ese directorio no se versiona: cada persona debe reconstruirlo localmente.
 
-## Agregar perfiles de Claude
+## Agregar perfiles
 
 Desde la app:
 
 1. Abrí la ventana principal desde el icono de la bandeja.
 2. Entrá a la sección de perfiles.
-3. Agregá un nombre y la carpeta de Claude del perfil que querés monitorear.
+3. Elegí el servicio (Claude Code u OpenAI Codex), poné un nombre y la carpeta del perfil que querés monitorear.
 
 Rutas comunes:
 
-- Windows: `C:\Users\TU_USUARIO\.claude`
-- WSL: `\\wsl.localhost\Ubuntu\home\TU_USUARIO\.claude`
+| Servicio | Ruta |
+|---|---|
+| Claude Code (Windows) | `C:\Users\TU_USUARIO\.claude` |
+| Claude Code (WSL) | `\wsl.localhost\Ubuntu\home\TU_USUARIO\.claude` |
+| OpenAI Codex | `C:\Users\TU_USUARIO\.codex` |
 
-La app usa la sesión local de cada carpeta de Claude. No copies credenciales al repositorio ni compartas el archivo `.credentials.json`.
+La app usa la sesión local de cada carpeta. No copies credenciales al repositorio ni compartas `.credentials.json` (Claude) ni `auth.json` (Codex).
+
+### Qué se ve de cada servicio
+
+Ninguno de los dos expone un número absoluto de tokens restantes: los dos publican **porcentaje consumido y momento de renovación**, que es lo que muestra la app.
+
+| Ventana de cuota | Claude Code | OpenAI Codex |
+|---|---|---|
+| Últimas 5 horas | sí | sí |
+| Últimos 7 días | sí | sí |
+| Fable, últimos 7 días | sí | no aplica |
+
+### Agregar otro servicio
+
+La app está armada para que sumar uno más (opencode, Cursor, etc.) sea un archivo nuevo en `claude_usage_tray/providers/` y una línea en el registro, sin tocar la API, la config ni la UI. Los pasos y el contrato están en [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Configuración y alertas
 
@@ -246,7 +264,7 @@ recupera; no poder escribir, no.
 
 Todo vive en `%APPDATA%\ClaudeUsage\` (normalmente `C:\Users\TU_USUARIO\AppData\Roaming\ClaudeUsage\`):
 
-- `config.json` — perfiles y preferencias (tema, colores, alertas). Es por computadora: cualquier ejecución de la app lee y escribe este mismo archivo.
+- `config.json` — perfiles (con su servicio) y preferencias (tema, colores, alertas). Es por computadora: cualquier ejecución de la app lee y escribe este mismo archivo.
 - `alert-state.json` — estado interno de las alertas (qué se notificó y cuándo). Se puede borrar sin perder configuración.
 - `budgets/<session-id>.json` — el techo de cada sesión que fijó uno. Borrar el archivo equivale a `/usage-budget off` en esa sesión. Los que quedan de sesiones muertas se barren solos a los 7 días.
 - `usage-cache-<cuenta>.json` — la última cifra de uso que leyó el hook, una por cuenta. Machine-written y descartable: sin esto, el hook haría una llamada a la API antes de cada prompt y de cada tool.

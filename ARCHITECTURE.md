@@ -13,6 +13,7 @@ por la que hay muchos archivos chicos en vez de un `app.py` gigante.
 | 1 | `paths.py` | Ubicación de los archivos en disco (`%APPDATA%\ClaudeUsage\`) y de los recursos empaquetados. |
 | 1 | `jsonstore.py` | Lectura/escritura de JSON de forma atómica (temp + rename) y manejo de archivos corruptos. |
 | 1 | `theme.py` | Paletas de color (oscuro/claro) y fuentes por rol. |
+| 1 | `providers/` | Un adapter por CLI (Claude Code, Codex, ...). Sabe donde viven las credenciales, que request hace falta para leer el uso y como mapear la respuesta a las ventanas de cuota compartidas. **Es la unica capa que conoce un servicio concreto.** |
 | 1 | `quotas.py` | Nombres de las ventanas de cuota (`session`, `weekly`, `weekly_fable`) y sus etiquetas. Fuente única para que el tooltip, el popup y las alertas llamen a cada cuota igual. |
 | 1 | `formatting.py` | Convierte datos crudos en texto para mostrar (porcentajes, fechas, tooltip). Sin dependencias de UI. |
 | 2 | `config.py` | Modelo de perfiles: alta, edición, reordenamiento, borrado, identidad estable por `id`, semilla de primer arranque. |
@@ -21,7 +22,7 @@ por la que hay muchos archivos chicos en vez de un `app.py` gigante.
 | 2 | `budget.py` | El techo de uso que un agente no debe pasar: cuál es el porcentaje que manda, la política pura de permitir / avisar / bloquear, y el store por sesión (`CLAUDE_CODE_SESSION_ID`). |
 | 2 | `icons.py` | Dibuja el icono de la bandeja y de la ventana con los colores del tema actual. |
 | 2 | `logging_setup.py` | Configura el log a `%APPDATA%\ClaudeUsage\claude-usage.log` y captura excepciones no manejadas (clave con `--windowed`, que descarta la consola). |
-| 3 | `api.py` | Habla con la API de uso de Anthropic y maneja backoff / rate limiting. |
+| 3 | `api.py` | Ejecuta el pedido que arma el adapter y maneja cache, backoff y rate limiting. Es agnostico del proveedor. |
 | 3 | `accounts.py` | De qué instalación de Claude se informa cuando no hay un usuario a quien preguntarle. Lee `CLAUDE_CONFIG_DIR`. |
 | 4 | `ui/` | Todas las ventanas. Ver abajo. |
 | 5 | `app.py` | El orquestador: arma el menú de la bandeja, la cola de UI, el loop de polleo y conecta todo. No contiene lógica de negocio ni construcción de widgets. |
@@ -141,3 +142,48 @@ con dependencias hacia abajo hace que:
   el camino listo para un port a Linux sin tocar el resto.
 - Un cambio de comportamiento tenga un hogar obvio en vez de sumar líneas a un
   archivo que ya nadie podía revisar.
+
+
+## `providers/`
+
+Cada proveedor es un modulo con un singleton `PROVIDER` y una linea en
+`providers/__init__._REGISTRY`. Nada mas en el proyecto nombra un proveedor:
+`api.py` despacha via `profile.adapter`, `config.py` le pregunta al adapter
+donde estan las credenciales, y la ventana de perfiles dibuja un radio button
+por cada entrada de `all_providers()`.
+
+| Modulo | Que es |
+|---|---|
+| `_types.py` | El contrato (`Provider`) y los helpers de normalizacion. |
+| `_claude.py` | Anthropic: `~/.claude/.credentials.json`, `api.anthropic.com/api/oauth/usage`, refresh via `claude update`. |
+| `_codex.py` | OpenAI Codex: `~/.codex/auth.json`, `chatgpt.com/backend-api/codex/usage`, refresh OAuth propio. |
+
+### Como se agrega uno nuevo
+
+1. Crear `providers/_<nombre>.py` con una clase que cumpla `Provider` y
+   exponer `PROVIDER = MiProvider()`.
+2. Registrarlo en `_REGISTRY`.
+3. Agregar su variable de entorno a `PROVIDER_HOME_ENV` en `tests/conftest.py`,
+   para que el aislamiento de tests siga siendo completo.
+
+Los tests de contrato de `tests/test_providers.py` corren automaticamente
+contra el adapter nuevo: shape del payload, tolerancia a respuestas raras,
+ventanas declaradas y manejo de credenciales ausentes o corruptas.
+
+### Por que el adapter no hace el request
+
+`usage_request()` devuelve una *descripcion* del GET en vez de ejecutarlo.
+`config.py` (L2) importa `providers` para saber donde viven las credenciales,
+asi que este paquete tiene que quedar en L1 y sin `requests` -- si no, todo
+modulo puro que toca un perfil arrastraria la capa de red
+(`tests/test_import_hygiene.py`). Como efecto secundario, el cache, el backoff
+y el reintento por 401 se escriben una sola vez en `api.py` en vez de una vez
+por proveedor.
+
+### Por que Codex no agrego ventanas de cuota nuevas
+
+La ventana `primary` de Codex es de 5 horas y la `secondary` de 7 dias, o sea
+exactamente `session` y `weekly`. Reusar esos ids hace que el tooltip, el
+popup, las alertas, el budget y el reporte MCP muestren un perfil de Codex sin
+un solo cambio. `weekly_fable` queda en `None`, que es el mismo caso que una
+cuenta de Claude sin Fable, ya soportado en todos lados.

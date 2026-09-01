@@ -47,7 +47,7 @@ WINDOW_SHORT: dict[str, str] = {
 
 #: `raw` keys already reported as their own window; everything else in `raw`
 #: that carries a utilization is a secondary limit (per-model cuts merged in
-#: by `api._merge_scoped_limits`, plus whatever the account happens to have).
+#: by the Claude adapter's `_merge_scoped_limits`, plus whatever the account has).
 _PRIMARY_RAW_KEYS = frozenset({"five_hour", "seven_day", "seven_day_fable"})
 
 
