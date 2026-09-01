@@ -14,12 +14,22 @@ App de Windows para ver el uso de Claude Code y de OpenAI Codex desde la bandeja
 
 Para entender cómo está organizado el código, ver [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Descargar y ejecutar
+
+El ejecutable compilado está versionado, así que no hace falta instalar Python ni compilar nada:
+
+**[⬇ Descargar ClaudeUsage.exe](https://github.com/ArroyoLeandro/usageChecker/raw/main/dist/ClaudeUsage.exe)**
+
+Lo bajás, lo ejecutás, y aparece en la bandeja del sistema. Nada más.
+
+> Windows SmartScreen puede avisar que es un ejecutable desconocido, porque el binario no está firmado. *Más información → Ejecutar de todas formas.*
+
 ## Requisitos
 
 - Windows.
-- Python 3 instalado para ejecutar el proyecto desde código fuente.
 - [Claude Code](https://claude.ai/download) y/o [OpenAI Codex](https://developers.openai.com/codex/) instalados. Alcanza con uno.
 - Tener sesión iniciada en el CLI del perfil que quieras consultar.
+- Python 3 **sólo** si vas a correrlo desde el código fuente o recompilarlo.
 
 ## Clonar e instalar
 
@@ -45,7 +55,11 @@ La app se abre en la bandeja del sistema. Si Claude Code no tiene una sesión in
 python build.py
 ```
 
-El ejecutable se genera en `dist/`. Ese directorio no se versiona: cada persona debe reconstruirlo localmente.
+El ejecutable se genera en `dist/ClaudeUsage.exe`.
+
+Ese binario **sí** se versiona, para que siempre haya una copia lista para descargar y ejecutar (ver [Descargar y ejecutar](#descargar-y-ejecutar)). El resto de `dist/` y todo `build/` quedan fuera del repo.
+
+Como cada rebuild agrega ~22 MB al historial de git de forma permanente, conviene commitear el `.exe` cuando publicás un cambio que querés que la gente use, no en cada compilación local.
 
 ## Agregar perfiles
 
