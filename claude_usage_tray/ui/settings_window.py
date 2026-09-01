@@ -52,6 +52,7 @@ from tkinter import colorchooser
 from typing import Callable, Mapping, Sequence
 
 from ..config import ClaudeProfile
+from .. import providers
 from ..quotas import QUOTA_WINDOWS, quota_label
 from ..settings import (
     MAX_ALERT_INTERVAL_MINUTES,
@@ -551,7 +552,12 @@ def _build_threshold_rows(
     this spends the resource we have and keeps the one we do not.
     """
     palette = theme.palette
-    for window in QUOTA_WINDOWS:
+    # Iterate the variables handed in, not the global tuple, so a caller can
+    # render a subset -- a Codex profile has no Fable quota, and a threshold
+    # field for a window its provider can never report would be a control
+    # that does nothing. `QUOTA_WINDOWS` still fixes the *order*, so the rows
+    # line up between one profile and the next.
+    for window in [w for w in QUOTA_WINDOWS if w in variables]:
         row = tk.Frame(parent, bg=palette.panel)
         row.pack(fill="x", pady=(4, 0))
 
@@ -727,7 +733,11 @@ def _build_alerts_section(
         per_profile: dict[str, dict[str, tuple[int, ...] | None]] = {}
         for profile in profiles:
             windows: dict[str, tuple[int, ...] | None] = {}
-            for window in QUOTA_WINDOWS:
+            # Only the windows this profile's provider reports -- the others
+            # have no field, so reading one would raise. Omitting them leaves
+            # them inheriting the general thresholds, which is what a window
+            # that never produces a number should do.
+            for window in providers.windows_for(profile.provider):
                 raw = profile_vars[(profile.id, window)].get().strip()
                 if not raw:
                     windows[window] = None  # blank == inherit this window
@@ -799,7 +809,7 @@ def _build_alerts_section(
             anchor="w",
         ).pack(fill="x")
 
-        for window in QUOTA_WINDOWS:
+        for window in providers.windows_for(profile.provider):
             profile_vars[(profile.id, window)] = tk.StringVar(
                 value=(
                     format_thresholds(alerts.profiles[profile.id][window])
@@ -821,7 +831,8 @@ def _build_alerts_section(
             block,
             theme,
             variables={
-                window: profile_vars[(profile.id, window)] for window in QUOTA_WINDOWS
+                window: profile_vars[(profile.id, window)]
+                for window in providers.windows_for(profile.provider)
             },
             hint_of=hint_of,
             on_submit=apply,
