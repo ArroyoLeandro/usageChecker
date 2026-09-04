@@ -20,9 +20,13 @@ from claude_usage_tray.budget import (
     from_mapping,
     highest_used_percent,
     load_budget,
+    parse_windows,
     save_budget,
     sweep_stale,
+    to_mapping,
+    used_percent_for,
 )
+from claude_usage_tray.quotas import QUOTA_WINDOWS
 
 
 @pytest.fixture
@@ -320,3 +324,69 @@ def test_the_sweep_spares_budgets_still_in_use(app_data_dir, session):
 
     assert sweep_stale() == 0
     assert load_budget() is not None
+
+# --- a ceiling that watches only some windows ------------------------------
+# The 5-hour window refills four times a day and is meant to be spent; the
+# weekly one is the money. An owner who caps "the week" and is stopped every
+# afternoon by the session window has been given a cap they did not ask for.
+
+
+def _payload(session, weekly):
+    return {
+        "session": {"utilization": session},
+        "weekly": {"utilization": weekly},
+        "weekly_fable": {"utilization": 3.0},
+    }
+
+
+def test_used_percent_for_narrows_to_the_named_windows():
+    payload = _payload(84.0, 17.0)
+    assert used_percent_for(payload) == 84.0
+    assert used_percent_for(payload, ("weekly", "weekly_fable")) == 17.0
+    assert used_percent_for(payload, ("session",)) == 84.0
+
+
+def test_used_percent_for_ignores_a_window_this_build_does_not_know():
+    assert used_percent_for(_payload(84.0, 17.0), ("weekly", "monthly")) == 17.0
+
+
+def test_a_selection_naming_no_measured_window_is_unknown_not_zero():
+    payload = {"session": {"utilization": 84.0}}
+    assert used_percent_for(payload, ("weekly",)) is None
+
+
+def test_a_weekly_ceiling_does_not_block_on_a_full_session_window():
+    weekly_only = Budget(ceiling_percent=60.0, windows=("weekly", "weekly_fable"))
+    payload = _payload(84.0, 17.0)
+    decision = evaluate(used_percent_for(payload, weekly_only.windows), weekly_only)
+    assert decision.action == "allow"
+    # ...and the same numbers under the default (all windows) DO block, which
+    # is what makes the case above a measurement rather than a tautology.
+    everything = Budget(ceiling_percent=60.0)
+    assert evaluate(used_percent_for(payload, everything.windows), everything).action == "block"
+
+
+def test_a_weekly_ceiling_still_blocks_when_the_week_fills():
+    weekly_only = Budget(ceiling_percent=60.0, windows=("weekly", "weekly_fable"))
+    payload = _payload(10.0, 61.0)
+    assert evaluate(used_percent_for(payload, weekly_only.windows), weekly_only).action == "block"
+
+
+def test_a_budget_written_before_windows_existed_watches_all_of_them():
+    restored = from_mapping({"ceiling_percent": 60.0})
+    assert restored is not None
+    assert restored.windows == QUOTA_WINDOWS
+
+
+def test_a_corrupt_window_list_widens_to_every_window_rather_than_none():
+    # Narrowing is the deliberate act. A malformed field must not silently
+    # turn a weekly cap into no cap at all.
+    for raw in ("weekly", 7, [], ["nonsense"], None):
+        assert parse_windows(raw) == QUOTA_WINDOWS
+
+
+def test_a_stored_selection_round_trips():
+    original = Budget(ceiling_percent=60.0, windows=("weekly", "weekly_fable"))
+    restored = from_mapping(to_mapping(original))
+    assert restored is not None
+    assert restored.windows == ("weekly", "weekly_fable")

@@ -106,7 +106,7 @@ def decide(prompt: str = "", session_id: str | None = None) -> budget_module.Dec
         return budget_module.Decision("allow", None, None)
     if OVERRIDE_TOKEN in prompt:
         return budget_module.Decision("allow", None, active)
-    return budget_module.evaluate(cache.used_percent(), active)
+    return budget_module.evaluate(cache.used_percent(windows=active.windows), active)
 
 
 def user_prompt_submit(event: dict[str, Any]) -> dict[str, Any] | None:

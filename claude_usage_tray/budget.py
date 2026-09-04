@@ -30,6 +30,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, Literal
 
 from . import jsonstore, paths
@@ -54,24 +55,34 @@ STALE_BUDGET_AGE_SECONDS = 7 * 24 * 60 * 60
 Action = Literal["allow", "warn", "block"]
 
 
-def highest_used_percent(payload: dict[str, Any] | None) -> float | None:
-    """The binding quota percentage in an `api.fetch_usage` payload.
+def used_percent_for(
+    payload: dict[str, Any] | None,
+    windows: Sequence[str] | None = None,
+) -> float | None:
+    """The binding quota percentage across the windows a caller cares about.
 
-    The maximum across windows, not the session window: quota is exhausted
-    when *any* window fills, so a caller watching only the 5-hour figure
-    reads 25% and keeps going while the weekly window dies at 66%. Returns
-    None when no window reported a number at all -- which is not 0, and must
+    Defaults to every window, which is the right answer for a report: quota
+    is exhausted when *any* window fills, so a reader watching only the
+    5-hour figure sees 25% and keeps going while the weekly window dies at
+    66%.
+
+    A *budget* is the one caller that legitimately narrows this. The plans
+    are not interchangeable: the 5-hour window refills four times a day and
+    is meant to be spent, while the weekly one is the money. An owner who
+    says "do not eat the week" and gets stopped every afternoon by the
+    session window has been given a cap they did not ask for -- and the
+    usual repair, raising the number until the afternoons stop hurting,
+    also raises the cap on the window they were actually protecting.
+
+    Unknown names are ignored rather than raising, and a selection that
+    names no window with a number returns None -- which is not 0, and must
     never be read as "plenty left".
-
-    Duplicated nowhere. `mcp_server/report.py` publishes this value and
-    `hooks/gate.py` enforces against it; if they ever computed it
-    separately, the number the agent was shown and the number that stopped
-    it could disagree.
     """
     if not payload:
         return None
+    selected = tuple(windows) if windows else QUOTA_WINDOWS
     values: list[float] = []
-    for window in QUOTA_WINDOWS:
+    for window in selected:
         entry = payload.get(window)
         if not isinstance(entry, dict):
             continue
@@ -85,6 +96,16 @@ def highest_used_percent(payload: dict[str, Any] | None) -> float | None:
     return max(values) if values else None
 
 
+def highest_used_percent(payload: dict[str, Any] | None) -> float | None:
+    """The binding quota percentage across ALL windows.
+
+    Kept as its own name because that is what a report publishes and what
+    `mcp_server/report.py` puts in `highest_used_percent`; the windowed
+    variant above is for budgets. Duplicated nowhere: both are one function.
+    """
+    return used_percent_for(payload, QUOTA_WINDOWS)
+
+
 @dataclass(frozen=True)
 class Budget:
     """A ceiling, and how early to warn before reaching it."""
@@ -92,6 +113,12 @@ class Budget:
     ceiling_percent: float
     warn_margin: float = DEFAULT_WARN_MARGIN
     note: str | None = None
+    #: Which quota windows this ceiling watches. All of them by default, so
+    #: a budget written before this field existed keeps its old meaning. A
+    #: caller that names only `("weekly", "weekly_fable")` is saying "cap the
+    #: week, let the 5-hour window refill and be spent" -- see
+    #: `used_percent_for` for why that is a real distinction and not a knob.
+    windows: tuple[str, ...] = QUOTA_WINDOWS
 
     @property
     def warn_at(self) -> float:
@@ -188,6 +215,7 @@ def to_mapping(budget: Budget) -> dict[str, Any]:
         "ceiling_percent": budget.ceiling_percent,
         "warn_margin": budget.warn_margin,
         "note": budget.note,
+        "windows": list(budget.windows),
     }
 
 
@@ -216,7 +244,22 @@ def from_mapping(raw: Any) -> Budget | None:
         ceiling_percent=ceiling,
         warn_margin=max(0.0, margin),
         note=note if isinstance(note, str) else None,
+        windows=parse_windows(raw.get("windows")),
     )
+
+
+def parse_windows(raw: Any) -> tuple[str, ...]:
+    """The windows a stored budget names, falling back to all of them.
+
+    Absent, malformed, or naming nothing this build knows about all resolve
+    to every window -- the pre-existing meaning. Narrowing is the deliberate
+    act; a corrupt field must not silently widen the account's exposure by
+    turning a weekly cap into no cap at all.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return QUOTA_WINDOWS
+    named = tuple(w for w in QUOTA_WINDOWS if w in {str(item) for item in raw})
+    return named or QUOTA_WINDOWS
 
 
 def current_session_id() -> str | None:
