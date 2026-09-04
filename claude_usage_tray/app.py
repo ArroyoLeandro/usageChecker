@@ -33,16 +33,31 @@ from .ui.widgets import apply_window_icon
 POLL_SECONDS = 300
 
 # The notify-icon id to ask the shell about when resolving our tray icon's
-# rectangle. pystray publishes neither the window handle nor the icon id, so
-# both are discovered rather than declared: `0` is the value the design-phase
-# spike measured answering on pystray's win32 backend, and `_hwnd` is the
-# private attribute it found the handle on. This is the fragile part of the
-# custom-tooltip path by construction -- a pystray upgrade could move either
-# -- which is exactly why failing to resolve them degrades to the native
-# tooltip instead of raising (tray-tooltip spec, "Native Tooltip Remains the
-# Fallback").
+# rectangle on Windows. pystray publishes neither the icon id nor the handle
+# it belongs to, so both are discovered rather than declared: `0` is the value
+# the design-phase spike measured answering on pystray's win32 backend, and
+# the seam names the private attribute the handle itself sits on
+# (`tray_handle_attribute()`). Inert on every other platform, where a status
+# item identifies itself. This is the fragile part of the custom-tooltip path
+# by construction -- a pystray upgrade could move either -- which is exactly
+# why failing to resolve them degrades to the native tooltip instead of
+# raising (tray-tooltip spec, "Native Tooltip Remains the Fallback").
 TRAY_ICON_UID = 0
-_TRAY_HWND_ATTRIBUTE = "_hwnd"
+
+# How many times to ask the OS for our icon's rect before concluding hover is
+# not available this session, and how long to leave between tries.
+#
+# The icon is not necessarily where the OS can measure it the instant it is
+# created. Measured on macOS: a fresh `NSStatusItem` reports an off-screen
+# placeholder frame for the first ~200ms and only then lands in the menu bar,
+# so a single probe at startup loses a race it wins a fifth of a second later.
+# Two seconds of budget clears that with room to spare on a loaded machine.
+#
+# Bounded, because the other reason a rect never resolves -- a Windows icon
+# parked in the taskbar overflow -- is permanent, and the user must reach the
+# native tooltip promptly rather than wait on retries that cannot succeed.
+HOVER_PROBE_ATTEMPTS = 20
+HOVER_PROBE_DELAY_S = 0.1
 
 # Spanish labels for the three quota windows an alert can name. Kept as a name
 # here because this module's toast has used it since it existed, but it is
@@ -125,10 +140,10 @@ class UsageTrayApp:
         self._color_baseline: Mapping[str, str] = {}
         self._hover_popup: tk.Toplevel | None = None
         self._hover_tracker: ui.HoverTracker | None = None
-        # Start on the native tooltip and earn the custom one: `_hwnd`, the
-        # icon id and a readable rect are all discovered at runtime, and
-        # anything we cannot confirm must leave the user with the tooltip
-        # that has always worked.
+        # Start on the native tooltip and earn the custom one: the tray
+        # handle, the icon id and a readable rect are all discovered at
+        # runtime, and anything we cannot confirm must leave the user with
+        # the tooltip that has always worked.
         self._native_tooltip = True
         # Strong reference to the ObjC object the platform seam installs as
         # the status item button's target (macOS only; `None` everywhere
@@ -498,35 +513,58 @@ class UsageTrayApp:
 
     # -- tray hover popup ---------------------------------------------------
 
-    def _start_hover_tracking(self) -> None:
+    def _start_hover_tracking(self, attempt: int = 1) -> None:
         """Promote to the custom hover popup, but only on evidence.
 
         Three things must hold, and each is checked rather than assumed: the
-        platform can report a tray rect at all, pystray still keeps its window
-        handle where the spike found it, and the shell actually answers for
+        platform can report a tray rect at all, pystray still keeps its tray
+        handle where the seam says to look, and the OS actually answers for
         our icon *right now*. Any of them missing leaves `_native_tooltip`
         true and the app behaving exactly as it did before this existed.
 
-        Must run after `icon.run()` has created the window -- `_hwnd` is
-        assigned inside pystray's `_run()`, so this is called from
-        `_on_icon_ready` for the same reason the first fetch is.
+        Must run after the icon's native object exists. On Windows that means
+        after `icon.run()` -- `_hwnd` is assigned inside pystray's `_run()`.
+        On macOS the `NSStatusItem` exists from construction, but reading its
+        window's frame is an AppKit call, so `_on_icon_ready` queues this onto
+        the UI loop there instead of calling it on pystray's setup thread.
         """
         if not platform.tray_hover_supported():
             log.info("tray hover not supported on this platform; keeping the native tooltip")
             return
 
-        hwnd = getattr(self._icon, _TRAY_HWND_ATTRIBUTE, None)
-        if not isinstance(hwnd, int) or not hwnd:
-            log.warning(
-                "could not read pystray's %r; keeping the native tooltip", _TRAY_HWND_ATTRIBUTE
-            )
+        attribute = platform.tray_handle_attribute()
+        if attribute is None:
+            log.info("no tray handle to resolve on this platform; keeping the native tooltip")
             return
 
-        if platform.tray_icon_rect(hwnd, TRAY_ICON_UID) is None:
+        native = getattr(self._icon, attribute, None)
+        # Falsy rather than `is None`: a zero `HWND` is as unusable as a
+        # missing attribute, and an `NSStatusItem` is always truthy.
+        if not native:
+            log.warning("could not read pystray's %r; keeping the native tooltip", attribute)
+            return
+
+        handle = platform.TrayHandle(native=native, uid=TRAY_ICON_UID)
+        rect = platform.tray_icon_rect(handle)
+        if rect is None:
+            if attempt < HOVER_PROBE_ATTEMPTS:
+                # Not necessarily a no: the icon may simply not be laid out
+                # yet. The retry is a *timed* one -- putting it straight back
+                # on the UI queue would burn the whole budget inside a single
+                # pump, which drains everything queued in one pass and would
+                # spend twenty attempts in under a millisecond.
+                log.debug(
+                    "no rect for our tray icon yet (attempt %s/%s)",
+                    attempt,
+                    HOVER_PROBE_ATTEMPTS,
+                )
+                self._retry_hover_probe(attempt + 1)
+                return
             log.warning(
-                "the shell reported no rect for our tray icon (hwnd=%s uid=%s); "
+                "the OS reported no rect for our tray icon after %s attempts (%s uid=%s); "
                 "keeping the native tooltip",
-                hwnd,
+                HOVER_PROBE_ATTEMPTS,
+                attribute,
                 TRAY_ICON_UID,
             )
             return
@@ -534,20 +572,86 @@ class UsageTrayApp:
         self._native_tooltip = False
         self._apply_to_tray(title="")
         self._hover_tracker = ui.HoverTracker(
-            rect_of=lambda: platform.tray_icon_rect(hwnd, TRAY_ICON_UID),
+            # Re-read on every tick, never cached: the icon moves whenever a
+            # neighbour appears or disappears in the menu bar / tray.
+            rect_of=lambda: platform.tray_icon_rect(handle),
             cursor_of=platform.cursor_position,
             # Every callback hops to the Tk main thread through the queue that
-            # already exists: these fire on the tracker's polling thread, and
-            # widget work off the main thread is exactly the bug this app's
-            # `_ui_queue` was built to prevent.
+            # already exists: on Windows these fire on the tracker's polling
+            # thread, and widget work off the main thread is exactly the bug
+            # this app's `_ui_queue` was built to prevent. On macOS the
+            # tracker is already on that thread and the hop is redundant, but
+            # it is also harmless -- and one dispatch path is one thing to
+            # reason about instead of two.
             on_enter=lambda rect: self._run_on_ui(lambda: self._show_hover_popup(rect)),
             on_leave=lambda: self._run_on_ui(self._hide_hover_popup),
             on_unavailable=lambda: self._run_on_ui(
                 lambda: self._fall_back_to_native_tooltip("the tray rect stopped resolving")
             ),
+            # Where the tray belongs to the host toolkit's loop, so does
+            # reading its geometry: `tray_icon_rect` touches live AppKit
+            # state on macOS, and a 30ms poll doing that from a daemon thread
+            # is the same undefined behaviour `_apply_to_tray` already routes
+            # around. `after()` on the Tk root *is* that loop.
+            scheduler=self._schedule_on_ui_loop
+            if platform.tray_requires_host_event_loop()
+            else None,
         )
         self._hover_tracker.start()
-        log.info("custom hover popup active (hwnd=%s uid=%s)", hwnd, TRAY_ICON_UID)
+        # The rect goes in the log because it is the one number that explains
+        # a popup nobody can make appear: a y far from the tray's own edge
+        # means the platform's coordinate flip is wrong, and no amount of
+        # staring at the hover logic would show that.
+        log.info(
+            "custom hover popup active (%s uid=%s rect=%s,%s %sx%s)",
+            attribute,
+            TRAY_ICON_UID,
+            rect.left,
+            rect.top,
+            rect.width,
+            rect.height,
+        )
+
+    def _start_hover_tracking_guarded(self, attempt: int = 1) -> None:
+        """`_start_hover_tracking`, with the enhancement's failure contract.
+
+        Hover is an enhancement, and losing it must never cost the user the
+        tray icon itself. The native tooltip survives any failure here
+        because `_native_tooltip` only flips once the promotion has fully
+        succeeded.
+        """
+        try:
+            self._start_hover_tracking(attempt)
+        except Exception:
+            log.exception("could not start hover tracking; keeping the native tooltip")
+
+    def _retry_hover_probe(self, attempt: int) -> None:
+        """Ask again for the tray rect, `HOVER_PROBE_DELAY_S` from now.
+
+        Two hops on purpose. `after()` is a Tk call and may only be made from
+        the main thread, but the first probe runs wherever `_on_icon_ready`
+        put it -- pystray's setup thread on Windows. The queue hop is what
+        makes the timer request legal from there; the timer is what makes the
+        retry actually wait.
+        """
+        self._run_on_ui(
+            lambda: self._schedule_on_ui_loop(
+                HOVER_PROBE_DELAY_S,
+                lambda: self._start_hover_tracking_guarded(attempt),
+            )
+        )
+
+    def _schedule_on_ui_loop(self, delay: float, fn) -> None:
+        """Run `fn` on the Tk main loop after `delay` seconds.
+
+        The `HoverTracker`'s alternative to owning a thread. Guarded because
+        `after` raises once the interpreter is tearing the root down, and a
+        tray app on its way out has nothing to gain from a traceback.
+        """
+        try:
+            self._root.after(max(1, int(delay * 1000)), fn)
+        except tk.TclError:
+            log.debug("could not schedule the hover poll; the root is gone")
 
     def _fall_back_to_native_tooltip(self, reason: str) -> None:
         """Give up on the custom popup for the rest of the session.
@@ -660,6 +764,36 @@ class UsageTrayApp:
         icon.stop()
         self._run_on_ui(self._root.quit)
 
+    def _bind_tray_hidpi(self) -> None:
+        """Ask the platform to rasterise the tray icon at the display's real
+        pixel density, then force one repaint so the sharper image lands.
+
+        A no-op returning `False` everywhere but macOS. Ordered before
+        `_bind_primary_click` deliberately: that method detaches the
+        `NSMenu` and rewires the status item button's target/action, while
+        this one only ever touches the button's *image*, so the two are
+        independent -- but doing the image first means a failure here cannot
+        leave the click rewiring half-applied.
+
+        The repaint goes through the public `icon` property rather than
+        pystray's `_update_icon()`: the setter invalidates the cached
+        `NSImage` and re-asserts it, which is exactly what is needed and is
+        the one part of this path that is documented API.
+        """
+        try:
+            installed = platform.bind_tray_hidpi_image(self._icon)
+        except Exception:
+            log.exception("could not install high-DPI tray rendering; keeping the default")
+            return
+        if not installed:
+            return
+        try:
+            self._icon.icon = self._icon.icon
+        except Exception:
+            log.exception("high-DPI tray rendering installed but the repaint failed")
+            return
+        log.info("tray icon renders at the display's backing scale factor")
+
     def _bind_primary_click(self) -> None:
         """Ask the platform to send a plain click straight to "Ver uso".
 
@@ -710,15 +844,17 @@ class UsageTrayApp:
         # runs on pystray's setup thread. Queued rather than called: by the
         # time the queue drains, `icon.run_detached()` has long since built
         # the menu this rewiring needs to find.
+        self._run_on_ui(self._bind_tray_hidpi)
         self._run_on_ui(self._bind_primary_click)
-        try:
-            self._start_hover_tracking()
-        except Exception:
-            # Same contract as the fetch below: hover is an enhancement, and
-            # losing it must never cost the user the tray icon itself. The
-            # native tooltip is still set, because `_native_tooltip` only
-            # flips once the promotion has fully succeeded.
-            log.exception("could not start hover tracking; keeping the native tooltip")
+        # Same reason as the two above where the tray belongs to the host
+        # loop: resolving the icon's rect reads AppKit state, and this
+        # callback is on pystray's setup thread. Queued, it also lands after
+        # the status item has been laid out, which a call made here would
+        # race against.
+        if platform.tray_requires_host_event_loop():
+            self._run_on_ui(self._start_hover_tracking_guarded)
+        else:
+            self._start_hover_tracking_guarded()
         try:
             self._fetch_and_update()
         except Exception:

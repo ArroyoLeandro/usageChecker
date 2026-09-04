@@ -14,7 +14,7 @@ import winreg
 from ctypes import wintypes
 from pathlib import Path
 
-from ._types import FileManagerError, Rect, WorkArea
+from ._types import FileManagerError, Rect, TrayHandle, WorkArea
 
 STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "ClaudeUsage"
@@ -124,22 +124,35 @@ def tray_hover_supported() -> bool:
     return True
 
 
-def tray_icon_rect(hwnd: int, uid: int) -> Rect | None:
+def tray_handle_attribute() -> str | None:
+    # pystray's win32 backend assigns the notify icon's window handle to
+    # `_hwnd` inside `_run()`. Private, hence discovered rather than declared.
+    return "_hwnd"
+
+
+def tray_icon_rect(handle: TrayHandle) -> Rect | None:
     """The screen rectangle of one notify icon, or `None` if unobtainable.
 
     `None` is a routine answer, not an error: an icon parked in the taskbar
     overflow flyout genuinely has no rect, and the shell says so by failing.
     The caller reads that as "cannot know" and falls back to the native
-    tooltip, per the seam's unknown-vs-unsupported rule.
+    tooltip, per the seam's unknown-vs-unsupported rule. A handle that is not
+    a usable `HWND` gets the same answer, for the same reason -- the caller
+    can do nothing different about a pystray that moved its attribute than
+    about an icon in the overflow.
 
-    `hwnd` and `uid` are plain ints supplied by the caller. This module never
-    touches pystray -- it is stdlib-only by layer, and reading a tray
-    library's private attribute is that library's business, not the OS's.
+    `handle.native` is the plain integer `HWND` and `handle.uid` the
+    notify-icon id, both supplied by the caller. This module never touches
+    pystray -- it is stdlib-only by layer, and reading a tray library's
+    private attribute is that library's business, not the OS's.
     """
+    hwnd = handle.native
+    if not isinstance(hwnd, int) or isinstance(hwnd, bool) or not hwnd:
+        return None
     identifier = _NOTIFYICONIDENTIFIER()
     identifier.cbSize = ctypes.sizeof(_NOTIFYICONIDENTIFIER)
     identifier.hWnd = wintypes.HWND(hwnd)
-    identifier.uID = wintypes.UINT(uid)
+    identifier.uID = wintypes.UINT(handle.uid)
     rect = _RECT()
     try:
         ctypes.windll.shell32.Shell_NotifyIconGetRect(ctypes.byref(identifier), ctypes.byref(rect))
@@ -177,3 +190,10 @@ def bind_tray_click(status_item, on_primary):
     # pystray's win32 backend honours `default=True` on a menu item, so the
     # primary click already reaches the right callback. Nothing to rewire.
     return None
+
+
+def bind_tray_hidpi_image(icon) -> bool:
+    # pystray's win32 backend builds an HICON at the size
+    # `GetSystemMetrics(SM_CXSMICON)` reports, which the shell already scales
+    # by the process's DPI awareness. No points/pixels mismatch to correct.
+    return False

@@ -34,6 +34,7 @@ por la que hay muchos archivos chicos en vez de un `app.py` gigante.
 |---|---|
 | `widgets.py` | Piezas reutilizables (botones, filas de progreso, icono de ventana, vista con scroll). |
 | `scroll.py` | Aritmética del scroll (pura, sin `tkinter`): asegura que ninguna ventana supere el alto de la pantalla. |
+| `button_state.py` | Lo que decide `widgets.FlatButton` (pura, sin `tkinter`): qué superficie corresponde a cada estado, si un release cuenta como clic, y qué opciones de `configure()` responde el botón en vez de reenviar. El botón se dibuja a mano porque en macOS Tk pinta el `tk.Button` nativo e ignora todos los colores. |
 | `dismiss.py` | Cierre al hacer clic afuera, con alcance seguro para varias ventanas flotantes. |
 | `hover.py` / `hover_popup.py` | Detección de hover sobre el icono de la bandeja y el tooltip propio que muestra. |
 | `popup.py` | Popup de uso. |
@@ -169,3 +170,12 @@ polleos ocurren en threads, `_apply_to_tray()` los reencamina por la misma
 desde otro thread no falla de entrada: corrompe o crashea más tarde, que en una
 app que repinta cada 5 minutos significa morirse de madrugada sin motivo
 aparente.
+
+Y la tercera, que es la misma regla mirada al revés: *leer* la geometría del
+icono también es AppKit. `tray_icon_rect()` pregunta por el frame de la ventana
+del `NSStatusItem`, y el tooltip propio la llama treinta veces por segundo. Por
+eso `HoverTracker` acepta un `scheduler`: en Windows el rect lo contesta el
+shell desde cualquier thread y el tracker se corre su propio daemon, mientras
+que acá `app.py` le pasa `root.after` y los polleos suceden en el loop que ya
+está corriendo. La máquina de estados es la misma; lo único que cambia de manos
+es el reloj.

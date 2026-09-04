@@ -358,3 +358,129 @@ def test_stop_is_idempotent():
     tracker = _tracker(_Recorder(), [ICON], [OUTSIDE])
     tracker.stop()
     tracker.stop()
+
+
+# ---------------------------------------------------------------------------
+# Host-loop driving: the same state machine, ticked by somebody else's loop
+#
+# macOS reads the tray rect out of live AppKit state, and AppKit is main-thread
+# only. The tracker's own daemon thread is therefore the wrong driver there,
+# and `app.py` hands it `root.after` instead. These tests use a scheduler that
+# records instead of waiting, so the arrangement is decidable with no Tk.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLoop:
+    """A scheduler that queues callbacks instead of waiting for a clock."""
+
+    def __init__(self) -> None:
+        self.pending: list[tuple[float, object]] = []
+
+    def schedule(self, delay, fn) -> None:
+        self.pending.append((delay, fn))
+
+    def run(self, ticks: int) -> None:
+        for _ in range(ticks):
+            if not self.pending:
+                return
+            _, fn = self.pending.pop(0)
+            fn()
+
+
+def test_a_scheduled_tracker_starts_no_thread():
+    # The whole point on macOS: a 30ms poll touching AppKit from a daemon
+    # thread is the undefined behaviour this avoids.
+    import threading
+
+    loop = _FakeLoop()
+    before = threading.active_count()
+    tracker = _tracker(_Recorder(), [ICON], [OUTSIDE], scheduler=loop.schedule)
+
+    tracker.start()
+
+    assert threading.active_count() == before
+    assert len(loop.pending) == 1
+
+
+def test_a_scheduled_tracker_reports_the_same_edges():
+    loop = _FakeLoop()
+    recorder = _Recorder()
+    tracker = _tracker(recorder, [ICON], [OUTSIDE, INSIDE, INSIDE, OUTSIDE], scheduler=loop.schedule)
+
+    tracker.start()
+    loop.run(4)
+
+    assert recorder.events == ["enter", "leave"]
+
+
+def test_each_scheduled_tick_re_arms_exactly_one_more():
+    # Re-armed at the end of the tick, not on a repeating timer: a slow poll
+    # must not queue up behind itself on a loop that also has to draw a UI.
+    loop = _FakeLoop()
+    tracker = _tracker(_Recorder(), [ICON], [OUTSIDE], scheduler=loop.schedule)
+
+    tracker.start()
+    for _ in range(5):
+        assert len(loop.pending) == 1
+        loop.run(1)
+
+    assert len(loop.pending) == 1
+    assert tracker.inside is False
+
+
+def test_a_scheduled_tracker_stops_re_arming_once_asked():
+    loop = _FakeLoop()
+    tracker = _tracker(_Recorder(), [ICON], [OUTSIDE], scheduler=loop.schedule)
+
+    tracker.start()
+    tracker.stop()
+    loop.run(1)
+
+    assert loop.pending == []
+
+
+def test_a_scheduled_tracker_stops_re_arming_once_retired():
+    # Retirement has to end the ticks as firmly as it ends the thread's loop,
+    # or a retired tracker would keep the host loop busy forever.
+    loop = _FakeLoop()
+    recorder = _Recorder()
+    tracker = _tracker(recorder, [None], [OUTSIDE], scheduler=loop.schedule, failure_limit=3)
+
+    tracker.start()
+    loop.run(10)
+
+    assert recorder.events == ["unavailable"]
+    assert loop.pending == []
+
+
+def test_starting_a_scheduled_tracker_twice_arms_it_once():
+    loop = _FakeLoop()
+    tracker = _tracker(_Recorder(), [ICON], [OUTSIDE], scheduler=loop.schedule)
+
+    tracker.start()
+    tracker.start()
+
+    assert len(loop.pending) == 1
+
+
+def test_a_raising_probe_retires_a_scheduled_tracker_too():
+    loop = _FakeLoop()
+    recorder = _Recorder()
+
+    def boom():
+        raise OSError("AppKit went away")
+
+    tracker = HoverTracker(
+        rect_of=boom,
+        cursor_of=lambda: OUTSIDE,
+        on_enter=recorder.on_enter,
+        on_leave=recorder.on_leave,
+        on_unavailable=recorder.on_unavailable,
+        failure_limit=3,
+        scheduler=loop.schedule,
+    )
+    tracker.start()
+    loop.run(10)
+
+    assert recorder.events == ["unavailable"]
+    assert loop.pending == []

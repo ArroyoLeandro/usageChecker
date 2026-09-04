@@ -5,7 +5,7 @@ App de Windows y macOS para ver el uso de Claude Code desde la bandeja del siste
 ## Características
 
 - **Perfiles**: agregar, editar (nombre y ruta), reordenar y eliminar cualquier perfil, incluido el detectado automáticamente.
-- **Tooltip propio** (Windows): al pasar el mouse por el icono de la bandeja aparece un resumen con los colores del tema, en lugar del tooltip gris del sistema. En macOS se usa el tooltip nativo, con la misma información.
+- **Tooltip propio**: al pasar el mouse por el icono de la bandeja aparece un resumen con los colores del tema, en lugar del tooltip gris del sistema. Funciona igual en Windows y en macOS; si el sistema no puede decir dónde está el icono, la app vuelve sola al tooltip nativo.
 - **Popup de uso**: ventana con el uso de cada perfil por ventana de cuota (últimas 5 horas, últimos 7 días, Fable).
 - **Configuración por usuario**: tema (oscuro/claro), tamaño de letra y colores personalizados por hex.
 - **Alertas**: aviso cuando el uso cruza un umbral, configurable por perfil y por ventana de cuota, con un tiempo mínimo entre avisos.
@@ -294,12 +294,15 @@ En Windows, todo vive en `%APPDATA%\ClaudeUsage\` (normalmente
 |---|---|---|
 | Dónde vive el icono | bandeja del sistema | barra de menú |
 | Token de sesión | `.credentials.json` | llavero (Keychain) |
-| Tooltip al pasar el mouse | propio, con los colores del tema | el nativo de macOS |
+| Tooltip al pasar el mouse | propio, con los colores del tema | propio, con los colores del tema |
 | Arranque automático | registro de Windows | LaunchAgent en `~/Library/LaunchAgents` |
 | Dónde se abre el popup | abajo a la derecha, sobre la barra de tareas | arriba a la derecha, bajo la barra de menú |
 
-El tooltip propio es el único recorte real: depende de poder preguntarle al
-sistema por el rectángulo del icono, y la barra de menú de macOS no expone nada
-equivalente. La app lo detecta y se queda con el tooltip nativo, que muestra la
-misma información.
+El tooltip propio necesita saber dónde está el icono en pantalla. Windows lo
+contesta con `Shell_NotifyIconGetRect`; macOS no tiene esa función, pero cada
+item de la barra de menú vive en su propia ventana y una ventana sí sabe su
+frame, así que la respuesta existe por otro camino. En las dos plataformas la
+app pregunta en cada polleo -- el icono se corre cuando aparece o desaparece
+otro al lado -- y si en algún momento deja de haber respuesta, vuelve sola al
+tooltip nativo, que muestra la misma información.
 

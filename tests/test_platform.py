@@ -30,6 +30,67 @@ def test_subprocess_flags_is_inert_off_windows():
 IS_DARWIN = sys.platform == "darwin"
 
 
+def _main_screen_height() -> float:
+    """The height of the screen Cocoa's global coordinate space is anchored to.
+
+    Deliberately a second, hand-rolled spelling of what `_darwin` computes:
+    a test that reused the seam's own helper would agree with it even when
+    both are wrong.
+    """
+    from AppKit import NSScreen
+
+    return float(NSScreen.screens()[0].frame().size.height)
+
+
+@pytest.fixture
+def macos_status_item():
+    """A real `NSStatusItem`, laid out in the real menu bar.
+
+    There is no faking this one. The whole claim under test is that AppKit
+    reports a true screen rectangle for a menu-bar item, and a stub would
+    only prove that the arithmetic runs.
+
+    The run loop is pumped until the item is actually laid out, not for a
+    fixed interval. A fresh status item carries an off-screen placeholder
+    frame (`origin.y = -33`) until AppKit places it in the bar, and how long
+    that takes is not ours to predict -- a fixed sleep makes these tests flaky
+    on a busy machine and hides the very race `app.py` retries around.
+    """
+    import time
+
+    import AppKit
+    import Foundation
+
+    app = AppKit.NSApplication.sharedApplication()
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+
+    status_bar = AppKit.NSStatusBar.systemStatusBar()
+    item = status_bar.statusItemWithLength_(AppKit.NSVariableStatusItemLength)
+    item.button().setTitle_("test")
+
+    screen_frame = AppKit.NSScreen.screens()[0].frame()
+    deadline = time.monotonic() + 10.0
+    laid_out = False
+    while time.monotonic() < deadline:
+        Foundation.NSRunLoop.currentRunLoop().runUntilDate_(
+            Foundation.NSDate.dateWithTimeIntervalSinceNow_(0.05)
+        )
+        window = item.button().window()
+        if window is not None and window.isVisible():
+            if AppKit.NSIntersectsRect(screen_frame, window.frame()):
+                laid_out = True
+                break
+
+    if not laid_out:
+        status_bar.removeStatusItem_(item)
+        pytest.skip("the menu bar never laid out a test status item on this machine")
+
+    try:
+        yield item
+    finally:
+        status_bar.removeStatusItem_(item)
+
+
 @pytest.mark.skipif(IS_DARWIN, reason="macOS answers this one; see the test below")
 def test_work_area_bounds_is_none_off_windows_and_macos():
     assert platform.work_area_bounds() is None
@@ -173,38 +234,136 @@ def test_app_data_root_is_a_path_under_home():
 
 
 # ---------------------------------------------------------------------------
-# Tray hover (slice e). "Cannot know" -> None/False, never an exception:
-# `app.py` reads that as "keep the native tooltip", which is a supported
-# outcome rather than a failure.
+# Tray hover (slice e, extended to macOS). "Cannot know" -> None/False, never
+# an exception: `app.py` reads that as "keep the native tooltip", which is a
+# supported outcome rather than a failure.
 # ---------------------------------------------------------------------------
 
 
-def test_tray_hover_is_not_supported_off_windows():
+@pytest.mark.skipif(IS_DARWIN, reason="macOS answers this one; see the tests below")
+def test_tray_hover_is_not_supported_on_linux():
     assert platform.tray_hover_supported() is False
 
 
-def test_tray_icon_rect_is_none_off_windows():
-    assert platform.tray_icon_rect(12345, 0) is None
+@pytest.mark.skipif(IS_DARWIN, reason="macOS names `_status_item`; see the tests below")
+def test_no_tray_handle_to_resolve_on_linux():
+    # With no rect query there is nothing to dig out of pystray, and saying
+    # so lets `app.py` stop before it reaches for a private attribute.
+    assert platform.tray_handle_attribute() is None
 
 
-def test_tray_icon_rect_does_not_raise_off_windows():
+@pytest.mark.skipif(IS_DARWIN, reason="macOS answers this one; see the tests below")
+def test_tray_icon_rect_is_none_on_linux():
+    assert platform.tray_icon_rect(platform.TrayHandle(native=12345, uid=0)) is None
+
+
+def test_tray_icon_rect_does_not_raise_for_a_useless_handle():
     # The distinction the seam draws: this is a value we cannot know, not an
     # action we cannot perform, so it must not raise the way
-    # set_startup_enabled does.
-    assert platform.tray_icon_rect(0, 0) is None
+    # set_startup_enabled does. A handle carrying nothing usable is the
+    # ordinary shape of "pystray moved its attribute".
+    assert platform.tray_icon_rect(platform.TrayHandle(native=None)) is None
+    assert platform.tray_icon_rect(platform.TrayHandle(native=0)) is None
+    assert platform.tray_icon_rect(platform.TrayHandle(native=object())) is None
 
 
-def test_cursor_position_is_none_off_windows():
+@pytest.mark.skipif(IS_DARWIN, reason="macOS answers this one; see the tests below")
+def test_cursor_position_is_none_on_linux():
     assert platform.cursor_position() is None
 
 
-def test_tray_icon_rect_defaults_to_the_uid_the_spike_measured():
+def test_tray_handle_defaults_to_the_uid_the_spike_measured():
     # uid=0 answered on pystray's win32 backend; the default records that
-    # finding rather than making every caller repeat it.
+    # finding rather than making every caller repeat it. It lives on the
+    # handle rather than in `tray_icon_rect`'s signature so that a datum only
+    # one platform needs does not shape the call every platform makes.
+    assert platform.TrayHandle(native=1).uid == 0
+
+
+def test_tray_icon_rect_takes_one_handle_not_a_windows_shaped_pair():
+    # The seam must not make macOS invent an `hwnd` it has no use for. One
+    # opaque handle per platform is the whole point of `TrayHandle`.
     import inspect
 
-    signature = inspect.signature(platform.tray_icon_rect)
-    assert signature.parameters["uid"].default == 0
+    parameters = list(inspect.signature(platform.tray_icon_rect).parameters)
+    assert parameters == ["handle"]
+
+
+# ---------------------------------------------------------------------------
+# Tray hover on macOS: the menu bar *can* answer, so unlike Linux it must not
+# return the "cannot know" sentinel. Assertions stay shape-level where the
+# numbers depend on the screen, and exact where a dropped Cocoa->Tk y-flip
+# would still pass a shape check.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="macOS-only: NSStatusBar")
+def test_tray_hover_is_supported_on_macos():
+    assert platform.tray_hover_supported() is True
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="macOS-only: pystray's NSStatusItem")
+def test_tray_handle_attribute_is_pystrays_status_item_on_macos():
+    assert platform.tray_handle_attribute() == "_status_item"
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="macOS-only: NSEvent.mouseLocation")
+def test_cursor_position_is_readable_on_macos():
+    point = platform.cursor_position()
+    assert point is not None
+    x, y = point
+    assert isinstance(x, int) and isinstance(y, int)
+    # Cocoa's y grows upward from the bottom of the screen, Tk's downward
+    # from the top. Dropping the flip would put the cursor off the bottom of
+    # a tall screen far more often than not, but the honest check is simply
+    # that the point lands on the desktop.
+    assert 0 <= y <= _main_screen_height()
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="macOS-only: NSStatusBar")
+def test_tray_icon_rect_measures_a_real_status_item_on_macos(macos_status_item):
+    """The claim `_darwin.tray_icon_rect` used to deny: the menu bar *does*
+    expose its item's rectangle."""
+    rect = platform.tray_icon_rect(platform.TrayHandle(native=macos_status_item))
+
+    assert rect is not None
+    assert rect.width > 0 and rect.height > 0
+    # The menu bar is at the top of the screen, so a correctly flipped rect
+    # starts within its own height of y=0. Unflipped, `top` would come back
+    # near the screen's full height instead -- which is exactly the bug that
+    # puts the tooltip at the bottom of the screen, and the one a shape-only
+    # assertion would wave through.
+    assert 0 <= rect.top < rect.height
+    assert rect.bottom <= _main_screen_height()
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="macOS-only: NSStatusBar")
+def test_tray_icon_rect_is_none_once_the_item_leaves_the_bar(macos_status_item):
+    # Retiring the item is the runtime shape of "the rect stopped resolving";
+    # the tracker's failure budget turns a run of these into a fall back to
+    # the native tooltip, so it has to be `None` and not an exception.
+    from AppKit import NSStatusBar
+
+    NSStatusBar.systemStatusBar().removeStatusItem_(macos_status_item)
+
+    assert platform.tray_icon_rect(platform.TrayHandle(native=macos_status_item)) is None
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="macOS-only: NSStatusBar")
+def test_the_cursor_and_the_rect_share_one_coordinate_space(macos_status_item):
+    # The single fact hover detection rests on: `Rect.contains` compares the
+    # two, so a rect in Tk coordinates and a cursor in Cocoa's would hit-test
+    # as "never inside" and the popup would simply never appear.
+    rect = platform.tray_icon_rect(platform.TrayHandle(native=macos_status_item))
+    assert rect is not None
+
+    from AppKit import NSEvent
+
+    cocoa = NSEvent.mouseLocation()
+    tk_point = platform.cursor_position()
+    assert tk_point is not None
+    assert tk_point[0] == round(cocoa.x)
+    assert tk_point[1] == round(_main_screen_height() - cocoa.y)
 
 
 # ---------------------------------------------------------------------------
@@ -273,3 +432,108 @@ def test_read_secret_never_raises_on_a_hostile_service_name():
     # so quoting and flag-looking values are inert rather than injectable.
     for name in ("", "-w", "a b'c\"d", "--help", "$(whoami)", "x" * 300):
         assert platform.read_secret(name) is None
+
+
+# --- high-DPI tray rendering ------------------------------------------------
+
+
+def test_bind_tray_hidpi_image_returns_false_for_an_object_that_is_not_a_tray_icon():
+    # The contract that keeps a pystray upgrade from costing the user the
+    # tray: an icon that does not look the way the fix expects is declined,
+    # never patched half-way and never raised over. On Windows/Linux this is
+    # an unconditional False for the same reason.
+    class NotAnIcon:
+        pass
+
+    assert platform.bind_tray_hidpi_image(NotAnIcon()) is False
+
+
+def test_bind_tray_hidpi_image_is_a_noop_off_macos():
+    if IS_DARWIN:
+        pytest.skip("macOS installs a real replacement; covered separately")
+
+    class FakeIcon:
+        _status_bar = object()
+        _status_item = object()
+
+        def _assert_image(self):
+            raise AssertionError("must not be called")
+
+    icon = FakeIcon()
+    original = icon._assert_image
+    assert platform.bind_tray_hidpi_image(icon) is False
+    assert icon._assert_image == original
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="the replacement only exists on macOS")
+def test_bind_tray_hidpi_image_replaces_only_the_instance_method():
+    from PIL import Image
+
+    from AppKit import NSStatusBar
+
+    class FakeStatusItem:
+        def __init__(self):
+            self.image = None
+
+        def button(self):
+            return self
+
+        def setImage_(self, image):
+            self.image = image
+
+    class FakeIcon:
+        def __init__(self):
+            self._status_bar = NSStatusBar.systemStatusBar()
+            self._status_item = FakeStatusItem()
+            self._icon_image = None
+            self._icon = Image.new("RGBA", (128, 128), (255, 0, 0, 255))
+            self.fallback_calls = 0
+
+        def _assert_image(self):
+            self.fallback_calls += 1
+
+    icon = FakeIcon()
+    class_method = type(icon)._assert_image
+
+    assert platform.bind_tray_hidpi_image(icon) is True
+    # The class is untouched: only this one object was patched, so a second
+    # pystray.Icon in the same process is unaffected.
+    assert type(icon)._assert_image is class_method
+    assert icon._assert_image != class_method
+
+    icon._assert_image()
+    assert icon.fallback_calls == 0, "the original ran, so the replacement failed"
+
+    thickness = int(icon._status_bar.thickness())
+    image = icon._status_item.image
+    assert image is not None
+    # The point of the whole exercise: the NSImage measures `thickness`
+    # POINTS while carrying `thickness * scale` pixels, which is what stops
+    # AppKit from stretching a 22 px bitmap across a 44 px backing store.
+    assert int(image.size().width) == thickness
+    assert int(image.size().height) == thickness
+    rep = image.representations()[0]
+    assert int(rep.pixelsWide()) >= thickness
+
+
+@pytest.mark.skipif(not IS_DARWIN, reason="the replacement only exists on macOS")
+def test_hidpi_replacement_falls_back_to_pystray_instead_of_raising():
+    # A pystray upgrade that changes the shape around `_assert_image` must
+    # cost sharpness, never the icon. Here `_icon` is missing entirely.
+    from AppKit import NSStatusBar
+
+    class FakeIcon:
+        def __init__(self):
+            self._status_bar = NSStatusBar.systemStatusBar()
+            self._status_item = object()
+            self._icon_image = None
+            self._icon = None
+            self.fallback_calls = 0
+
+        def _assert_image(self):
+            self.fallback_calls += 1
+
+    icon = FakeIcon()
+    assert platform.bind_tray_hidpi_image(icon) is True
+    icon._assert_image()
+    assert icon.fallback_calls == 1

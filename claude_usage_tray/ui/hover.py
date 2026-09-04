@@ -13,6 +13,15 @@ the entire reason the spike had to exist -- are decidable on Linux, with no
 tray, no cursor, and no display server. The thread in `run()` is a loop
 around it and holds no logic of its own.
 
+*Who* drives the ticks is injected too, for a reason that is not symmetry.
+On Windows the rect query is a shell call any thread may make, so the tracker
+owns a daemon thread. On macOS it reads AppKit state, which only the main
+thread may touch -- and the main thread there is already running Tk's loop.
+Passing a `scheduler` (`app.py` hands over `root.after`) makes the tracker
+tick on that loop instead of starting a thread that would be undefined
+behaviour on every poll. The state machine is identical either way; only the
+clock changes hands.
+
 Two states -- OUTSIDE and INSIDE -- and one retirement:
 
   1. rect is None            -> count a failure; leave if we were inside, so
@@ -62,15 +71,19 @@ CursorOf = Callable[[], "tuple[int, int] | None"]
 OnEnter = Callable[["Rect"], None]
 OnLeave = Callable[[], None]
 OnUnavailable = Callable[[], None]
+#: Run a callable after a delay in seconds, on whatever loop the host owns.
+#: `root.after` in seconds-and-callable clothing.
+Scheduler = Callable[[float, Callable[[], None]], None]
 
 
 class HoverTracker:
     """Polls a rectangle against the cursor and reports enter/leave edges.
 
-    Callbacks fire on the polling thread, never the Tk main thread -- the
-    caller is responsible for hopping them across (`app.py` puts them on its
-    existing UI queue). This class deliberately does not know that a UI
-    exists.
+    Callbacks fire on whichever thread drives the ticks: the tracker's own
+    daemon thread by default, or the host loop's thread when a `scheduler`
+    is supplied. The caller is responsible for getting them onto the Tk main
+    thread either way (`app.py` puts them on its existing UI queue). This
+    class deliberately does not know that a UI exists.
     """
 
     def __init__(
@@ -83,6 +96,7 @@ class HoverTracker:
         on_unavailable: OnUnavailable,
         interval: float = POLL_INTERVAL_S,
         failure_limit: int = DEFAULT_FAILURE_LIMIT,
+        scheduler: Scheduler | None = None,
     ) -> None:
         self._rect_of = rect_of
         self._cursor_of = cursor_of
@@ -91,11 +105,13 @@ class HoverTracker:
         self._on_unavailable = on_unavailable
         self._interval = interval
         self._failure_limit = failure_limit
+        self._scheduler = scheduler
         self._inside = False
         self._failures = 0
         self._retired = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._started = False
 
     @property
     def inside(self) -> bool:
@@ -137,33 +153,65 @@ class HoverTracker:
             self._on_leave()
         self._inside = now_inside
 
-    def run(self) -> None:
-        """Poll until `stop()` or retirement. Blocks; `start()` threads it.
+    def _guarded_poll(self) -> None:
+        """`poll_once`, with a raise counted as a failed read.
 
-        Each tick is individually guarded for the same reason `app.py`'s UI
-        pump is: a single raising poll must not end hover detection for the
-        life of the process, silently, in a way that looks nothing like the
-        original failure.
+        Guarded for the same reason `app.py`'s UI pump is: a single raising
+        poll must not end hover detection for the life of the process,
+        silently, in a way that looks nothing like the original failure. It
+        counts toward the same budget an unreadable rect does, so a source of
+        exceptions retires the tracker instead of spinning forever.
         """
+        try:
+            self.poll_once()
+        except Exception:  # noqa: BLE001 - see docstring
+            self._failures += 1
+            if self._failures >= self._failure_limit and not self._retired:
+                self._retired = True
+                self._on_unavailable()
+
+    def run(self) -> None:
+        """Poll until `stop()` or retirement. Blocks; `start()` threads it."""
         while not self._stop.is_set() and not self._retired:
             started = time.perf_counter()
-            try:
-                self.poll_once()
-            except Exception:  # noqa: BLE001 - see docstring
-                self._failures += 1
-                if self._failures >= self._failure_limit and not self._retired:
-                    self._retired = True
-                    self._on_unavailable()
+            self._guarded_poll()
             elapsed = time.perf_counter() - started
             self._stop.wait(max(0.0, self._interval - elapsed))
 
+    def tick(self) -> None:
+        """One scheduled poll, which re-arms itself. Blocks for one poll only.
+
+        The host-loop counterpart of `run()`'s body. Re-arming at the end
+        rather than on a fixed timer is what keeps a slow poll from queueing
+        up behind itself on a loop that also has a UI to draw.
+        """
+        if self._stop.is_set() or self._retired or self._scheduler is None:
+            return
+        self._guarded_poll()
+        if self._stop.is_set() or self._retired:
+            return
+        self._scheduler(self._interval, self.tick)
+
     def start(self) -> None:
-        """Run `run()` on a daemon thread."""
+        """Begin polling: on the injected scheduler if there is one, on a
+        daemon thread otherwise. Idempotent."""
+        if self._scheduler is not None:
+            if self._started:
+                return
+            self._started = True
+            self._scheduler(self._interval, self.tick)
+            return
         if self._thread is not None:
             return
+        self._started = True
         self._thread = threading.Thread(target=self.run, name="hover-tracker", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        """Ask the polling thread to finish. Idempotent."""
+        """Ask polling to finish. Idempotent, and safe from either driver.
+
+        The thread checks the flag between waits; a scheduled `tick` checks it
+        before polling and before re-arming, so at most one more poll runs and
+        nothing is rescheduled after it.
+        """
         self._stop.set()

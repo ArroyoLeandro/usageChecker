@@ -10,7 +10,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from ._types import FileManagerError, PlatformUnsupportedError, Rect, WorkArea
+from ._types import FileManagerError, PlatformUnsupportedError, Rect, TrayHandle, WorkArea
 
 
 def set_app_user_model_id(app_id: str) -> None:
@@ -53,7 +53,13 @@ def tray_hover_supported() -> bool:
     return False
 
 
-def tray_icon_rect(hwnd: int, uid: int) -> Rect | None:
+def tray_handle_attribute() -> str | None:
+    # Nothing to reach for: with no rect query there is no handle worth
+    # digging out of pystray. `None` is the caller's cue to stop early.
+    return None
+
+
+def tray_icon_rect(handle: TrayHandle) -> Rect | None:
     # No `Shell_NotifyIconGetRect` equivalent here, and no tray model this
     # app targets. "Cannot know", not "cannot do": the caller degrades to the
     # native tooltip rather than seeing an exception.
@@ -81,3 +87,10 @@ def tray_anchor_edge() -> str:
 def bind_tray_click(status_item, on_primary):
     # Same as Windows: the backend's own default-item handling applies.
     return None
+
+
+def bind_tray_hidpi_image(icon) -> bool:
+    # pystray's X11/AppIndicator backends hand the tray a PNG and let the
+    # panel scale it; there is no per-image "points vs pixels" declaration to
+    # correct, so there is nothing to replace here.
+    return False

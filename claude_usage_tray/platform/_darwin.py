@@ -5,6 +5,7 @@ Selected by `platform/__init__.py` only when running on macOS.
 
 from __future__ import annotations
 
+import logging
 import os
 import plistlib
 import shlex
@@ -12,7 +13,9 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
-from ._types import FileManagerError, PlatformUnsupportedError, Rect, WorkArea
+from ._types import FileManagerError, PlatformUnsupportedError, Rect, TrayHandle, WorkArea
+
+log = logging.getLogger(__name__)
 
 
 def set_app_user_model_id(app_id: str) -> None:
@@ -171,17 +174,190 @@ def app_data_root() -> Path:
 
 
 def tray_hover_supported() -> bool:
+    # There is no `Shell_NotifyIconGetRect` here, but there does not need to
+    # be: every status item owns an `NSStatusBarWindow`, and a window knows
+    # its own frame. See `tray_icon_rect` for the measurement.
+    return True
+
+
+def tray_handle_attribute() -> str | None:
+    # pystray's macOS backend builds the `NSStatusItem` in `Icon.__init__`
+    # and keeps it on `_status_item`. Private, hence discovered rather than
+    # declared -- the same bargain `_hwnd` strikes on Windows.
+    return "_status_item"
+
+
+def _cocoa_flip_height() -> float | None:
+    """El alto contra el que se invierte la `y` de Cocoa, o `None`.
+
+    Cocoa mide la `y` hacia arriba desde el borde INFERIOR de la pantalla
+    principal; Tk la mide hacia abajo desde el borde SUPERIOR de esa misma
+    pantalla. Las dos son coordenadas globales, así que la conversión es
+    `y_tk = alto_principal - y_cocoa` para cualquier punto, esté en la
+    pantalla que esté.
+
+    Multi-monitor: la tentación es invertir contra la pantalla que contiene
+    el icono, y es un error. En un escritorio de varias pantallas hay UN solo
+    espacio global de coordenadas y su ancla es la pantalla principal; las
+    demás viven en `y` positiva o negativa respecto de ella. Invertir contra
+    el alto de un monitor secundario daría un desplazamiento igual a la
+    diferencia de alturas, que es cero en el caso de dos monitores iguales
+    (por eso el error sobrevive a una prueba casual) y decenas de píxeles en
+    cuanto no lo son.
+
+    La pantalla principal se busca por su definición -- la que está en el
+    origen -- en vez de confiar en `screens()[0]` a ciegas. Ambas cosas
+    coinciden en la práctica, pero la primera es verificable acá y la segunda
+    es una promesa de la documentación de AppKit; si algún día no coinciden,
+    el origen es el que manda para esta cuenta. `mainScreen()` no sirve: es
+    la pantalla de la ventana activa, no la del origen.
+    """
+    try:
+        from AppKit import NSScreen
+
+        screens = NSScreen.screens()
+    except Exception:
+        return None
+    if not screens:
+        return None
+    for screen in screens:
+        frame = screen.frame()
+        if frame.origin.x == 0.0 and frame.origin.y == 0.0:
+            return float(frame.size.height)
+    return float(screens[0].frame().size.height)
+
+
+def _is_on_a_screen(origin_x: float, origin_y: float, width: float, height: float) -> bool:
+    """Si ese rectángulo de Cocoa cae sobre alguna pantalla conectada.
+
+    Un `NSStatusItem` recién creado tiene botón y window desde el principio,
+    pero hasta que AppKit lo acomoda en la barra su frame es un placeholder
+    fuera de pantalla (medido: `origin.y = -33`, o sea justo debajo del borde
+    inferior). Ese frame se ve perfectamente sano -- ancho y alto positivos,
+    `isVisible` en `True` -- y sin este control el arranque podría anclar el
+    tooltip a un lugar donde no hay ningún icono, que es peor que no tener
+    tooltip propio: el usuario ve una ventana aparecer sola en un rincón.
+
+    Se prueba contra todas las pantallas, no contra la principal, porque la
+    barra de menú puede estar en un monitor secundario.
+    """
+    try:
+        from AppKit import NSScreen
+
+        screens = NSScreen.screens()
+    except Exception:
+        return False
+    right = origin_x + width
+    top = origin_y + height
+    for screen in screens:
+        frame = screen.frame()
+        s_left = float(frame.origin.x)
+        s_bottom = float(frame.origin.y)
+        s_right = s_left + float(frame.size.width)
+        s_top = s_bottom + float(frame.size.height)
+        if origin_x < s_right and right > s_left and origin_y < s_top and top > s_bottom:
+            return True
     return False
 
 
-def tray_icon_rect(hwnd: int, uid: int) -> Rect | None:
-    # The menu bar is not a notify-icon tray and exposes no equivalent rect
-    # query. "Cannot know" -> the caller keeps the native tooltip.
-    return None
+def tray_icon_rect(handle: TrayHandle) -> Rect | None:
+    """El rectángulo en pantalla del icono de la barra de menú, o `None`.
+
+    Cada `NSStatusItem` vive en su propio `NSStatusBarWindow`, y ese window
+    ES la ranura del item: medido contra una barra real, su frame da el ancho
+    exacto del botón y el alto completo de la barra de menú. Por eso se usa
+    el frame del window y no el del botón -- el botón ocupa sólo la franja
+    central, y hit-testear contra él dejaría afuera la fila de píxeles de más
+    arriba, que es justo donde macOS deposita el cursor cuando uno empuja el
+    mouse contra el borde de la pantalla.
+
+    El frame llega en coordenadas de Cocoa (origen abajo a la izquierda) y
+    sale en las de Tk (origen arriba a la izquierda), invertido contra el
+    alto que documenta `_cocoa_flip_height`. Olvidarse de esa inversión no
+    rompe nada de forma visible: simplemente pone el tooltip abajo de todo.
+
+    El resultado no se puede cachear. El item se corre horizontalmente cada
+    vez que aparece o desaparece otro icono en la barra, así que un rect
+    leído una vez está mal a los pocos segundos.
+
+    Toda falla -- pyobjc ausente, handle que no es un status item, pystray
+    que cambió de atributo, item ya retirado de la barra -- termina en `None`,
+    que el llamador lee como "no se puede saber" y responde volviendo al
+    tooltip nativo. AppKit sólo se puede tocar desde el main thread, y el
+    llamador es responsable de eso (ver `tray_requires_host_event_loop`).
+    """
+    status_item = handle.native
+    if status_item is None:
+        return None
+    try:
+        button = status_item.button()
+        if button is None:
+            return None
+        window = button.window()
+        if window is None:
+            # El item existe pero todavía no lo montaron en la barra. Sin
+            # window no hay geometría que leer.
+            return None
+        # Un item retirado de la barra conserva su botón, su window y un
+        # frame de aspecto perfectamente normal -- medido, sigue devolviendo
+        # el rectángulo que ocupaba, o uno viejo fuera de pantalla. Lo único
+        # que cambia es `isVisible`. Sin este control el llamador anclaría el
+        # tooltip a un icono que ya no existe en vez de volver al nativo.
+        if not window.isVisible() or button.isHidden():
+            return None
+        frame = window.frame()
+        width = float(frame.size.width)
+        height = float(frame.size.height)
+        origin_x = float(frame.origin.x)
+        origin_y = float(frame.origin.y)
+    except Exception:
+        log.debug("could not read the status item's frame", exc_info=True)
+        return None
+
+    if width <= 0 or height <= 0:
+        return None
+    if not _is_on_a_screen(origin_x, origin_y, width, height):
+        return None
+
+    flip_height = _cocoa_flip_height()
+    if flip_height is None:
+        return None
+
+    left = int(round(origin_x))
+    # El borde superior en Tk es lo que queda por encima del borde superior
+    # del rect en Cocoa (`origin_y + height`, porque Cocoa mide desde abajo).
+    top = int(round(flip_height - (origin_y + height)))
+    return Rect(
+        left=left,
+        top=top,
+        right=left + int(round(width)),
+        bottom=top + int(round(height)),
+    )
 
 
 def cursor_position() -> tuple[int, int] | None:
-    return None
+    """La posición del cursor en el mismo espacio que `tray_icon_rect`.
+
+    `NSEvent.mouseLocation()` es una consulta al servidor de ventanas, no una
+    lectura de la jerarquía de vistas, así que a diferencia del frame del
+    status item no depende del main thread. Devuelve coordenadas de Cocoa y
+    se invierte con el mismo alto, que es lo único que garantiza que el punto
+    y el rect se puedan comparar.
+    """
+    try:
+        from AppKit import NSEvent
+
+        point = NSEvent.mouseLocation()
+        x = float(point.x)
+        y = float(point.y)
+    except Exception:
+        log.debug("could not read the cursor position", exc_info=True)
+        return None
+
+    flip_height = _cocoa_flip_height()
+    if flip_height is None:
+        return None
+    return int(round(x)), int(round(flip_height - y))
 
 
 #: How long to let `security` run before giving up. It is a local Keychain
@@ -338,3 +514,125 @@ def bind_tray_click(status_item: Any, on_primary: Callable[[], None]) -> Any | N
     # anywhere above leaves the original behaviour intact.
     status_item.setMenu_(None)
     return target
+
+
+def _backing_scale_factor() -> float:
+    """The main screen's pixels-per-point, or `1.0` when it cannot be read.
+
+    2.0 on every Retina Mac, 1.0 on an external non-Retina display, and
+    occasionally 3.0. Degrades to 1.0 rather than raising: rendering at 1x is
+    the old, merely-blurry behaviour, and a missing screen is not worth
+    costing the user a tray icon.
+    """
+    try:
+        from AppKit import NSScreen
+
+        screen = NSScreen.mainScreen()
+        if screen is None:
+            return 1.0
+        scale = float(screen.backingScaleFactor())
+    except Exception:
+        return 1.0
+    return scale if scale >= 1.0 else 1.0
+
+
+def bind_tray_hidpi_image(icon: Any) -> bool:
+    """Make the menu-bar icon render at the display's real pixel density.
+
+    THIS REPLACES A PRIVATE METHOD OF A DEPENDENCY. Specifically, it swaps
+    the *instance* attribute `_assert_image` on a `pystray.Icon` built from
+    pystray's macOS backend (`pystray/_darwin.py`, verified against pystray
+    0.19.5). The class is left untouched: only this one object is affected,
+    and only for as long as it lives.
+
+    Why: pystray's own `_assert_image` resizes the PIL image to
+    `(thickness, thickness)` -- 22x22 actual pixels -- serialises that to PNG
+    and builds an `NSImage` from the data. An `NSImage` created that way
+    reports a size of 22x22 *points* at 1x, so on a Retina display AppKit has
+    22 pixels to fill 44, and stretches them. The icon is blurry, and no
+    amount of care in the drawing code can fix it, because the detail is gone
+    before AppKit ever sees it.
+
+    The fix is one line of intent: rasterise at `thickness * backingScaleFactor`
+    pixels and then declare the image's size in POINTS with `setSize_`, which
+    is how a @2x/@3x asset tells AppKit "these pixels cover this much space".
+
+    If a future pystray moves, renames or restructures `_assert_image`, the
+    symptom is a blurry-but-working icon (this returns `False` and logs at
+    warning, having changed nothing), or -- if the method exists but its
+    surroundings changed -- a blurry-but-working icon plus an exception
+    logged per repaint, because every failure inside the replacement falls
+    back to pystray's original bound method. The icon is never lost.
+
+    Returns `True` if the replacement was installed. Callers must repaint
+    afterwards (assigning `icon.icon` back to itself is enough) for the
+    sharper image to reach the screen.
+    """
+    try:
+        import io
+
+        import AppKit
+        import Foundation
+        from PIL import Image
+    except Exception:
+        log.warning("no pyobjc/PIL; the tray icon keeps pystray's 1x rendering", exc_info=True)
+        return False
+
+    status_bar = getattr(icon, "_status_bar", None)
+    status_item = getattr(icon, "_status_item", None)
+    original = getattr(icon, "_assert_image", None)
+    if status_bar is None or status_item is None or not callable(original):
+        log.warning(
+            "pystray's macOS backend does not look as expected "
+            "(_status_bar/_status_item/_assert_image); keeping its 1x rendering"
+        )
+        return False
+
+    def _assert_image_hidpi() -> None:
+        try:
+            thickness = int(status_bar.thickness())
+            if thickness <= 0:
+                raise ValueError(f"non-positive status bar thickness: {thickness}")
+
+            # Same cache contract as pystray's: `_update_icon` sets
+            # `_icon_image` to None before calling this, so an unchanged
+            # NSImage of the right POINT size means there is nothing to do.
+            cached = getattr(icon, "_icon_image", None)
+            if cached is not None:
+                current = cached.size()
+                if int(current.width) == thickness and int(current.height) == thickness:
+                    return
+
+            source = icon._icon
+            if source is None:
+                raise ValueError("no PIL image set on the icon")
+
+            pixels = max(1, int(round(thickness * _backing_scale_factor())))
+            rendered = source.convert("RGBA")
+            if rendered.size != (pixels, pixels):
+                rendered = rendered.resize((pixels, pixels), Image.LANCZOS)
+
+            buffer = io.BytesIO()
+            rendered.save(buffer, "png")
+            image = AppKit.NSImage.alloc().initWithData_(Foundation.NSData(buffer.getvalue()))
+            if image is None:
+                raise ValueError("NSImage could not be built from the rendered PNG")
+
+            # The whole point: `pixels` px of bitmap declared to occupy
+            # `thickness` points, so AppKit treats it as a @2x/@3x asset and
+            # draws it 1:1 on the backing store instead of upscaling.
+            image.setSize_(AppKit.NSMakeSize(float(thickness), float(thickness)))
+
+            icon._icon_image = image
+            button = status_item.button()
+            if button is None:
+                raise ValueError("the status item has no button to set the image on")
+            button.setImage_(image)
+        except Exception:
+            # Loud, but never fatal: the user gets pystray's blurry icon back
+            # rather than a tray app that dies on a repaint.
+            log.exception("high-DPI tray rendering failed; falling back to pystray's")
+            original()
+
+    icon._assert_image = _assert_image_hidpi
+    return True
