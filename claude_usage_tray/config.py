@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from . import jsonstore, paths
+from . import jsonstore, paths, providers
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_PROFILE_NAME = "Perfil actual"
 
 
@@ -29,30 +28,50 @@ class ClaudeProfile:
     id: str
     name: str
     config_dir: Path
+    provider: str = providers.DEFAULT_ID
 
     @property
     def credentials_path(self) -> Path:
-        return self.config_dir / ".credentials.json"
+        """Where this profile's session lives -- the adapter decides.
+
+        Was hardcoded to `.credentials.json`, which was true of the only
+        provider that existed. Codex keeps its session in `auth.json`, so the
+        filename became a provider fact rather than a universal one.
+        """
+        return providers.credentials_path(self.provider, self.config_dir)
+
+    @property
+    def adapter(self) -> providers.Provider:
+        """The registered adapter for this profile, or the default when the
+        stored `provider` is unknown to this build (see `providers.get`)."""
+        return providers.get(self.provider)
 
     @property
     def is_ambient_default(self) -> bool:
-        """Whether this profile points at the machine's own Claude directory
-        (as opposed to a second account, a copy, or a mounted WSL path).
+        """Whether this profile points at the machine's own directory *for its
+        own provider* -- as opposed to a second account, a copy, or a mounted
+        WSL path.
 
-        The condition `supports_refresh` has always tested, given its own
-        name because a second caller now needs it for an unrelated reason:
-        on macOS the credentials live in a Keychain entry that belongs to
-        whichever account Claude Code itself is logged into, so only the
-        ambient default profile may read it. Two callers asking the same
-        question through one property beats two copies of `_paths_equal`.
+        Compared against `self.adapter.default_config_dir()`, never against
+        Claude's: a Codex profile sitting in `~/.codex` is every bit as
+        ambient as a Claude profile sitting in `~/.claude`, and measuring it
+        against Claude would report it as foreign forever.
+
+        It carries its own name because the condition is read in two
+        registers -- "may I renew this session?" just below, and "is this the
+        directory the local CLI administers?" inside the adapters, which is
+        what gates Claude's macOS Keychain fallback and its `claude update`
+        refresh. The adapters cannot call this property (they are handed a
+        bare `Path`, not a profile) so they repeat the comparison; what does
+        not get repeated is the criterion.
         """
-        return _paths_equal(self.config_dir, default_claude_dir())
+        return _paths_equal(self.config_dir, self.adapter.default_config_dir())
 
     @property
     def supports_refresh(self) -> bool:
         """Derived, never stored. True iff `config_dir` is the ambient
-        default Claude directory -- see profile-management spec,
-        "supports_refresh Is Derived". Computed fresh on every read so an
+        default directory of this profile's provider -- see profile-management
+        spec, "supports_refresh Is Derived". Computed fresh on every read so an
         edited `config_dir` immediately reflects the correct value; the old
         code hardcoded this to `True` for the one profile whose `config_dir`
         could never change, which made the hardcode tautologically safe.
@@ -77,6 +96,13 @@ class AppConfig:
 
     profiles: list[ClaudeProfile] = field(default_factory=list)
     settings: Mapping[str, Any] = field(default_factory=dict)
+
+    #: Version of the file this config was read from, `SCHEMA_VERSION` for
+    #: anything freshly built. Carried so `load_config` can tell "written by
+    #: a build that had no providers" (< 3) from "written by this one", which
+    #: is what makes the one-time provider adoption run exactly once instead
+    #: of on every launch.
+    schema_version: int = SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -122,9 +148,17 @@ class ProfileNotFoundError(KeyError):
 
 
 def default_claude_dir() -> Path:
-    if os.environ.get("CLAUDE_CONFIG_DIR"):
-        return Path(os.environ["CLAUDE_CONFIG_DIR"]).expanduser()
-    return Path.home() / ".claude"
+    """The ambient Claude directory. Kept as a named function, and still
+    Claude-specific, because `accounts.py` and the profiles window both mean
+    *Claude* when they call it -- the MCP server and the hooks are spawned by
+    Claude Code and report on the account that launched them. Generic callers
+    want `providers.get(id).default_config_dir()` instead."""
+    return providers.get("claude").default_config_dir()
+
+
+def default_config_dir_for(provider_id: str) -> Path:
+    """The ambient config directory for any registered provider."""
+    return providers.get(provider_id).default_config_dir()
 
 
 def normalize_config_dir(value: str | None) -> Path | None:
@@ -134,7 +168,12 @@ def normalize_config_dir(value: str | None) -> Path | None:
     if not value:
         return None
     path = Path(value).expanduser()
-    if path.name.lower() == ".credentials.json":
+    # A user who pastes the credentials *file* means the folder holding it.
+    # Checked against every registered provider rather than a single literal,
+    # so pasting `~/.codex/auth.json` works exactly as `~/.claude/.credentials.json`
+    # always has.
+    filenames = {p.credentials_filename.lower() for p in providers.all_providers()}
+    if path.name.lower() in filenames:
         return path.parent
     return path
 
@@ -153,50 +192,104 @@ def _normalized_key(path: Path) -> str:
         return str(path.expanduser()).lower()
 
 
-def _main_profile_name(config_dir: Path) -> str:
-    credentials_path = config_dir / ".credentials.json"
+def _main_profile_name(config_dir: Path, provider_id: str = providers.DEFAULT_ID) -> str:
+    """A display name for an auto-detected profile.
+
+    The account label now comes from the adapter (`claudeAiOauth.email` for
+    Claude, the id_token's `email` claim for Codex) rather than from a
+    hardcoded credentials shape. The environment/home fallbacks are unchanged,
+    but the provider's display name is appended to them: with two providers
+    seeded at once, two profiles both called "Kanji" would be unreadable,
+    while "Kanji (OpenAI Codex)" says which is which.
+    """
+    adapter = providers.get(provider_id)
     try:
-        if credentials_path.exists():
-            creds = json.loads(credentials_path.read_text(encoding="utf-8"))
-            oauth = creds.get("claudeAiOauth", {})
-            for key in ("email", "username", "name", "displayName"):
-                value = oauth.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-    except (OSError, json.JSONDecodeError, AttributeError):
-        pass
+        label = adapter.account_label(config_dir)
+    except Exception:
+        label = None
+    if label:
+        return label
 
     for key in ("CLAUDE_PROFILE_NAME", "USERNAME", "USER"):
         value = os.environ.get(key, "").strip()
         if value:
-            return value
+            return f"{value} ({adapter.display_name})"
 
     home_name = Path.home().name.strip()
     if home_name:
-        return home_name
+        return f"{home_name} ({adapter.display_name})"
 
-    return DEFAULT_PROFILE_NAME
+    return f"{DEFAULT_PROFILE_NAME} ({adapter.display_name})"
 
 
 def seed_profile() -> ClaudeProfile | None:
-    """Attempt to auto-detect the ambient Claude config directory and build
-    a candidate profile from it.
+    """Attempt to auto-detect the ambient **Claude** config directory and
+    build a candidate profile from it.
 
-    Returns `None` when no such directory is detectable -- callers
-    (`load_config`) must handle that by starting with an empty profile
-    list, without error, per profile-management spec's First-Run Seed
-    requirement ("if found" is a real condition, not always-true: the old
-    `default_profile()` built a profile unconditionally, even when
-    `~/.claude` did not exist).
+    Returns `None` when no such directory is detectable -- callers must
+    handle that by starting with an empty profile list, without error, per
+    profile-management spec's First-Run Seed requirement ("if found" is a
+    real condition, not always-true).
+
+    Deliberately still single-provider and still Claude: its remaining
+    callers are `api.fetch_usage`'s no-argument fallback and
+    `accounts.profile_for`, both of which mean "the Claude account this
+    process belongs to". First-run seeding goes through `seed_profiles()`.
     """
     config_dir = default_claude_dir()
     if not config_dir.is_dir():
         return None
     return ClaudeProfile(
         id=str(uuid.uuid4()),
-        name=_main_profile_name(config_dir),
+        name=_main_profile_name(config_dir, providers.DEFAULT_ID),
         config_dir=config_dir,
+        provider=providers.DEFAULT_ID,
     )
+
+
+def seed_profiles() -> list[ClaudeProfile]:
+    """One profile per provider actually installed on this machine.
+
+    This is what makes "see both quotas at once" the default rather than a
+    setup step: a user with `~/.claude` and `~/.codex` gets both rows on
+    first run, in registry order, with no configuration. A user with neither
+    gets an empty list -- the same no-error empty start `seed_profile()`
+    returning `None` has always produced.
+    """
+    return [
+        ClaudeProfile(
+            id=str(uuid.uuid4()),
+            name=_main_profile_name(adapter.default_config_dir(), adapter.id),
+            config_dir=adapter.default_config_dir(),
+            provider=adapter.id,
+        )
+        for adapter in providers.detect_installed()
+    ]
+
+
+def adopt_new_providers(profiles: list[ClaudeProfile]) -> list[ClaudeProfile]:
+    """Append a seeded profile for every installed provider not yet present.
+
+    Runs once, when a `config.json` written before `SCHEMA_VERSION` 3 is
+    loaded. Without it, an existing user upgrading to a multi-provider build
+    would see exactly what they saw before -- their Claude profile, alone --
+    and would have to discover the feature to use it.
+
+    Matches on provider id, not on directory: a user who had already added
+    `~/.codex` by hand as a (mislabelled) Claude profile keeps their entry
+    rather than gaining a duplicate row for the same folder, which
+    `_assert_unique` would reject on the next edit anyway.
+    """
+    present = {profile.provider for profile in profiles}
+    existing_dirs = {_normalized_key(profile.config_dir) for profile in profiles}
+    adopted = list(profiles)
+    for candidate in seed_profiles():
+        if candidate.provider in present:
+            continue
+        if _normalized_key(candidate.config_dir) in existing_dirs:
+            continue
+        adopted.append(candidate)
+    return adopted
 
 
 class _SchemaInvalid(Exception):
@@ -229,11 +322,21 @@ def _parse_app_config(raw: Any) -> AppConfig:
             raise _SchemaInvalid("profile entry missing a valid 'name'")
         if not isinstance(raw_config_dir, str) or not raw_config_dir:
             raise _SchemaInvalid("profile entry missing a valid 'config_dir'")
+        # `provider` is read tolerantly, never strictly. It is absent from
+        # every config written before SCHEMA_VERSION 3, and those files are
+        # not corrupt -- they predate the field. Absent, or any non-string,
+        # means the only provider that existed then: Claude. An unrecognised
+        # *string* is likewise kept rather than rejected, so that opening an
+        # older build against a newer config does not quarantine the user's
+        # profile list; `providers.get` degrades it at read time instead.
+        raw_provider = item.get("provider")
+        provider = raw_provider if isinstance(raw_provider, str) and raw_provider else providers.DEFAULT_ID
         profiles.append(
             ClaudeProfile(
                 id=profile_id,
                 name=name,
                 config_dir=Path(raw_config_dir).expanduser(),
+                provider=provider,
             )
         )
 
@@ -245,7 +348,9 @@ def _parse_app_config(raw: Any) -> AppConfig:
     # cost the two-file split exists to manage. Profiles stay strict above.
     raw_settings = raw.get("settings")
     settings = dict(raw_settings) if isinstance(raw_settings, dict) else {}
-    return AppConfig(profiles=profiles, settings=settings)
+    raw_version = raw.get("schema_version")
+    version = raw_version if isinstance(raw_version, int) else 1
+    return AppConfig(profiles=profiles, settings=settings, schema_version=version)
 
 
 def _seed_and_maybe_persist(settings: Mapping[str, Any] | None = None) -> ConfigLoad:
@@ -257,9 +362,8 @@ def _seed_and_maybe_persist(settings: Mapping[str, Any] | None = None) -> Config
     corruption path passes nothing, and rightly so -- there the settings are
     unreadable, not merely unaccompanied.
     """
-    candidate = seed_profile()
     config = AppConfig(
-        profiles=[candidate] if candidate is not None else [],
+        profiles=seed_profiles(),
         settings=dict(settings) if settings else {},
     )
     if config.profiles:
@@ -312,6 +416,20 @@ def load_config() -> ConfigLoad:
     if not config.profiles:
         return _seed_and_maybe_persist(config.settings)
 
+    if config.schema_version < SCHEMA_VERSION:
+        # One-time upgrade: adopt any provider installed on this machine that
+        # the pre-provider config could not have known about, then rewrite at
+        # the current version so this never runs again. Persisted immediately
+        # rather than left in memory, because a user who deletes an adopted
+        # profile must have that stick -- re-adopting it on the next launch
+        # would make the row impossible to remove.
+        config = AppConfig(
+            profiles=adopt_new_providers(config.profiles),
+            settings=config.settings,
+            schema_version=SCHEMA_VERSION,
+        )
+        save_config(config)
+
     return ConfigLoad(config=config, notices=[], read_only=False)
 
 
@@ -326,7 +444,12 @@ def save_config(config: AppConfig) -> None:
     payload = {
         "schema_version": SCHEMA_VERSION,
         "profiles": [
-            {"id": profile.id, "name": profile.name, "config_dir": str(profile.config_dir)}
+            {
+                "id": profile.id,
+                "name": profile.name,
+                "config_dir": str(profile.config_dir),
+                "provider": profile.provider,
+            }
             for profile in config.profiles
         ],
         "settings": dict(config.settings),
@@ -334,7 +457,13 @@ def save_config(config: AppConfig) -> None:
     jsonstore.write_json_atomic(paths.config_file(), payload)
 
 
-def add_profile(profiles: list[ClaudeProfile], *, name: str, config_dir: Path) -> list[ClaudeProfile]:
+def add_profile(
+    profiles: list[ClaudeProfile],
+    *,
+    name: str,
+    config_dir: Path,
+    provider: str = providers.DEFAULT_ID,
+) -> list[ClaudeProfile]:
     """Return a new profile list with a freshly-created profile appended.
 
     Raises `DuplicateConfigDirError` if `config_dir` (normalized,
@@ -348,6 +477,7 @@ def add_profile(profiles: list[ClaudeProfile], *, name: str, config_dir: Path) -
         id=str(uuid.uuid4()),
         name=name.strip() or DEFAULT_PROFILE_NAME,
         config_dir=normalized,
+        provider=provider or providers.DEFAULT_ID,
     )
     return [*profiles, new_profile]
 
@@ -358,6 +488,7 @@ def edit_profile(
     *,
     name: str | None = None,
     config_dir: Path | None = None,
+    provider: str | None = None,
 ) -> list[ClaudeProfile]:
     """Return a new profile list with the entry matching `profile_id`
     updated in place (position preserved). `id` never changes.
@@ -385,6 +516,7 @@ def edit_profile(
                 id=profile.id,
                 name=(name.strip() or profile.name) if name is not None else profile.name,
                 config_dir=normalized_dir if normalized_dir is not None else profile.config_dir,
+                provider=provider if provider else profile.provider,
             )
         )
     if not found:

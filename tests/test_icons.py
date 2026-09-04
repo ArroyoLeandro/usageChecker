@@ -378,3 +378,87 @@ def test_icons_follow_the_palette_they_are_given():
     img = tray_icon(_bundle(50), custom, size=SIZE)
     assert _count_color(img, "#11a800") > 0
     assert _count_color(img, DARK.accent) == 0
+
+
+# --- the icon reads a real multi-provider bundle -----------------------------
+#
+# The helpers above build bundles by hand. These four go through
+# `providers.<adapter>.normalize` instead, because the risk they cover is a
+# seam, not a drawing: a Codex profile declares only two quota windows, so its
+# normalized payload carries `weekly_fable: None`. Nothing in the icon path
+# ever asks which provider a payload came from -- it asks
+# `formatting.availability_pct_from_bundle` for one number -- so the question
+# worth pinning is whether a provider that reports fewer windows still yields
+# a number, and the right one.
+
+
+def _normalized(provider_id: str, raw: dict) -> dict:
+    from claude_usage_tray import providers
+
+    return providers.get(provider_id).normalize(raw)
+
+
+CLAUDE_PAYLOAD = {"five_hour": {"utilization": 10.0}, "seven_day": {"utilization": 20.0}}
+CODEX_PAYLOAD = {
+    "rate_limit": {
+        "primary_window": {"used_percent": 40.0},
+        "secondary_window": {"used_percent": 70.0},
+    }
+}
+
+
+def test_a_codex_profiles_missing_fable_window_does_not_erase_its_availability():
+    """`weekly_fable` is `None` for every Codex profile, by design.
+
+    `availability_pct` skips a window it cannot read rather than treating it
+    as zero, so the number comes from the two windows Codex does report --
+    here 100-70, the scarcer of them. A `None` that counted as "0% available"
+    would paint every Codex user's tray permanently red.
+    """
+    bundle = {"profiles": [{"id": "cx", "data": _normalized("codex", CODEX_PAYLOAD)}]}
+
+    assert formatting.availability_pct_from_bundle(bundle) == 30.0
+
+
+def test_the_scarcest_profile_sets_the_icon_across_providers():
+    """One tray icon, two services: the bundle takes the minimum, so the
+    account closest to its ceiling is the one the glyph reports -- regardless
+    of which provider that account belongs to."""
+    claude = {"id": "cl", "data": _normalized("claude", CLAUDE_PAYLOAD)}
+    codex = {"id": "cx", "data": _normalized("codex", CODEX_PAYLOAD)}
+    mixed = {"profiles": [claude, codex]}
+
+    # Claude is at 80% available, Codex at 30%; Codex binds.
+    assert formatting.availability_pct_from_bundle(mixed) == 30.0
+    assert _digest(tray_icon(mixed, DARK, size=SIZE)) == _digest(
+        tray_icon({"profiles": [codex]}, DARK, size=SIZE)
+    )
+
+
+def test_a_signed_out_codex_profile_renders_the_no_data_glyph():
+    """Every window `None` -- what a profile whose CLI has no session looks
+    like once normalized. It must reach the same picture as an empty bundle,
+    not raise and not invent a value."""
+    empty_codex = {
+        "profiles": [{"id": "cx", "data": _normalized("codex", {})}]
+    }
+
+    assert formatting.availability_pct_from_bundle(empty_codex) is None
+    assert _digest(tray_icon(empty_codex, DARK, size=SIZE)) == _digest(
+        tray_icon({"primary": {}}, DARK, size=SIZE)
+    )
+
+
+def test_every_registered_provider_normalizes_into_a_drawable_bundle():
+    """The contract the icon depends on, asserted against the registry rather
+    than against a list of provider ids -- so an adapter added later is
+    covered here the day it is registered."""
+    from claude_usage_tray import providers
+
+    for adapter in providers.all_providers():
+        data = adapter.normalize({})
+        bundle = {"profiles": [{"id": adapter.id, "data": data}]}
+
+        assert set(data) >= {"session", "weekly", "weekly_fable"}, adapter.id
+        assert formatting.availability_pct_from_bundle(bundle) is None, adapter.id
+        assert tray_icon(bundle, DARK, size=SIZE).size == (SIZE, SIZE), adapter.id

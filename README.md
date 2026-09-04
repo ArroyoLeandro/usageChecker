@@ -1,26 +1,39 @@
 # Claude Usage
 
-App de Windows y macOS para ver el uso de Claude Code desde la bandeja del sistema (la barra de menú en Mac) y consultar varios perfiles de Claude desde una sola ventana.
+App de Windows y macOS para ver el uso de Claude Code y de OpenAI Codex desde la bandeja del sistema (la barra de menú en Mac), con todas tus cuentas en una sola ventana.
 
 ## Características
 
-- **Perfiles**: agregar, editar (nombre y ruta), reordenar y eliminar cualquier perfil, incluido el detectado automáticamente.
+- **Varios servicios a la vez**: Claude Code y OpenAI Codex en la misma lista, cada uno con su cuota y su renovación. Si tenés los dos instalados, la app los detecta sola en el primer arranque.
+- **Perfiles**: agregar, editar (servicio, nombre y ruta), reordenar y eliminar cualquier perfil, incluido el detectado automáticamente.
 - **Tooltip propio**: al pasar el mouse por el icono de la bandeja aparece un resumen con los colores del tema, en lugar del tooltip gris del sistema. Funciona igual en Windows y en macOS; si el sistema no puede decir dónde está el icono, la app vuelve sola al tooltip nativo.
-- **Popup de uso**: ventana con el uso de cada perfil por ventana de cuota (últimas 5 horas, últimos 7 días, Fable).
+- **Popup de uso**: ventana con el uso de cada perfil por ventana de cuota (últimas 5 horas, últimos 7 días, Fable). Codex reporta las dos primeras; no tiene Fable.
 - **Configuración por usuario**: tema (oscuro/claro), tamaño de letra y colores personalizados por hex.
 - **Alertas**: aviso cuando el uso cruza un umbral, configurable por perfil y por ventana de cuota, con un tiempo mínimo entre avisos.
 - **Persistencia**: toda la configuración se guarda en la carpeta de datos del usuario (ver [Dónde se guardan los datos](#dónde-se-guardan-los-datos)).
 
 Para entender cómo está organizado el código, ver [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Descargar y ejecutar
+
+El ejecutable compilado está versionado, así que no hace falta instalar Python ni compilar nada:
+
+**[⬇ Descargar ClaudeUsage.exe](https://github.com/ArroyoLeandro/usageChecker/raw/main/dist/ClaudeUsage.exe)**
+
+Lo bajás, lo ejecutás, y aparece en la bandeja del sistema. Nada más.
+
+> Windows SmartScreen puede avisar que es un ejecutable desconocido, porque el binario no está firmado. *Más información → Ejecutar de todas formas.*
+
+En **macOS** no hay binario publicado: el `.app` se arma en un minuto desde el código fuente (ver [Compilar](#compilar)), y firmarlo para distribuirlo requiere una cuenta de desarrollador de Apple.
+
 ## Requisitos
 
 - Windows, o macOS 11 o posterior.
-- Python 3.10 o superior para ejecutar el proyecto desde código fuente.
+- [Claude Code](https://claude.ai/download) y/o [OpenAI Codex](https://developers.openai.com/codex/) instalados. Alcanza con uno.
+- Tener sesión iniciada en el CLI del perfil que quieras consultar.
+- Python 3.10 o superior **sólo** si vas a correrlo desde el código fuente o recompilarlo.
   En Mac conviene el instalador oficial de [python.org](https://www.python.org/downloads/macos/):
   trae su propio Tcl/Tk 8.6, y el Python 3.9 que viene con el sistema no alcanza.
-- [Claude Code](https://claude.ai/download) instalado.
-- Tener sesión iniciada en Claude Code en el perfil que quieras consultar.
 
 ## Clonar e instalar
 
@@ -42,7 +55,7 @@ pedirlo aparte.
 python launcher.py
 ```
 
-La app se abre en la bandeja del sistema. Si Claude Code no tiene una sesión iniciada, la app no podrá leer el uso hasta que abras Claude e inicies sesión.
+La app se abre en la bandeja del sistema. Un perfil sin sesión iniciada en su CLI aparece como "hace falta iniciar sesión": abrí Claude Code o Codex, según el perfil, e iniciá sesión ahí.
 
 ## Compilar
 
@@ -50,31 +63,52 @@ La app se abre en la bandeja del sistema. Si Claude Code no tiene una sesión in
 python build.py
 ```
 
-El mismo script produce lo que corresponda al sistema donde corre: un `.exe`
-en Windows y un `ClaudeUsage.app` en macOS. Todo va a parar a `dist/`, que no
-se versiona: cada persona lo reconstruye localmente.
+El mismo script produce lo que corresponda al sistema donde corre: un
+`dist/ClaudeUsage.exe` en Windows y un `dist/ClaudeUsage.app` en macOS.
 
 En Mac, arrastrá `dist/ClaudeUsage.app` a `/Applications` y abrilo desde ahí.
 El bundle se marca como `LSUIElement`, así que no aparece en el Dock ni tiene
 menú propio: vive sólo en la barra de menú. La primera vez macOS puede pedir
-permiso para leer el llavero (ver abajo); dale **Permitir siempre** para que no
-vuelva a preguntar en cada actualización.
+permiso para leer el llavero (ver [De dónde saca la sesión](#de-dónde-saca-la-sesión));
+dale **Permitir siempre** para que no vuelva a preguntar en cada actualización.
 
-## Agregar perfiles de Claude
+El `.exe` **sí** se versiona, para que siempre haya una copia lista para descargar y ejecutar (ver [Descargar y ejecutar](#descargar-y-ejecutar)). El `.app` de macOS no, y el resto de `dist/` y todo `build/` quedan fuera del repo.
+
+Como cada rebuild agrega ~22 MB al historial de git de forma permanente, conviene commitear el `.exe` cuando publicás un cambio que querés que la gente use, no en cada compilación local.
+
+## Agregar perfiles
 
 Desde la app:
 
 1. Abrí la ventana principal desde el icono de la bandeja.
 2. Entrá a la sección de perfiles.
-3. Agregá un nombre y la carpeta de Claude del perfil que querés monitorear.
+3. Elegí el servicio (Claude Code u OpenAI Codex), poné un nombre y la carpeta del perfil que querés monitorear.
 
 Rutas comunes:
 
-- Windows: `C:\Users\TU_USUARIO\.claude`
-- macOS: `/Users/TU_USUARIO/.claude`
-- WSL: `\\wsl.localhost\Ubuntu\home\TU_USUARIO\.claude`
+| Servicio | Ruta |
+|---|---|
+| Claude Code (Windows) | `C:\Users\TU_USUARIO\.claude` |
+| Claude Code (macOS) | `/Users/TU_USUARIO/.claude` |
+| Claude Code (WSL) | `\\wsl.localhost\Ubuntu\home\TU_USUARIO\.claude` |
+| OpenAI Codex (Windows) | `C:\Users\TU_USUARIO\.codex` |
+| OpenAI Codex (macOS) | `/Users/TU_USUARIO/.codex` |
 
-La app usa la sesión local de cada carpeta de Claude. No copies credenciales al repositorio ni compartas el archivo `.credentials.json`.
+La app usa la sesión local de cada carpeta. No copies credenciales al repositorio ni compartas `.credentials.json` (Claude) ni `auth.json` (Codex).
+
+### Qué se ve de cada servicio
+
+Ninguno de los dos expone un número absoluto de tokens restantes: los dos publican **porcentaje consumido y momento de renovación**, que es lo que muestra la app.
+
+| Ventana de cuota | Claude Code | OpenAI Codex |
+|---|---|---|
+| Últimas 5 horas | sí | sí |
+| Últimos 7 días | sí | sí |
+| Fable, últimos 7 días | sí | no aplica |
+
+### Agregar otro servicio
+
+La app está armada para que sumar uno más (opencode, Cursor, etc.) sea un archivo nuevo en `claude_usage_tray/providers/` y una línea en el registro, sin tocar la API, la config ni la UI. Los pasos y el contrato están en [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Configuración y alertas
 
@@ -86,6 +120,10 @@ Desde la ventana principal, pestaña **Configuración**:
 
 ## De dónde saca la sesión
 
+Cada servicio guarda su token donde quiere, y el adapter de cada uno sabe
+dónde buscarlo. Codex es el caso simple: `auth.json` dentro de la carpeta del
+perfil, en cualquier sistema operativo. Claude Code depende del sistema.
+
 En Windows y Linux, Claude Code deja el token en `.credentials.json` dentro de
 la carpeta del perfil, y la app lo lee de ahí.
 
@@ -96,11 +134,12 @@ ya le da acceso — por eso el permiso se pide una sola vez y no en cada consult
 
 Ese detalle tiene una consecuencia: la entrada del llavero es **una sola** y no
 distingue carpetas de configuración, así que sólo puede responder por el perfil
-que apunta a tu `~/.claude`. Un segundo perfil en Mac que apunte a otra carpeta
-va a mostrar "sin sesión" salvo que esa carpeta tenga su propio
+que apunta a tu `~/.claude`. Un segundo perfil de Claude en Mac que apunte a
+otra carpeta va a mostrar "sin sesión" salvo que esa carpeta tenga su propio
 `.credentials.json` (por ejemplo, una `.claude` de WSL montada). Es a propósito:
 la alternativa sería mostrar el uso de tu cuenta principal con el nombre de otro
-perfil.
+perfil. Los perfiles de Codex no tienen este límite, porque su token siempre
+está en un archivo dentro de la carpeta que vos elegiste.
 
 ## Servidor MCP: que un agente consulte el uso
 
@@ -282,7 +321,7 @@ En Windows, todo vive en `%APPDATA%\ClaudeUsage\` (normalmente
 `C:\Users\TU_USUARIO\AppData\Roaming\ClaudeUsage\`). En macOS, en
 `~/Library/Application Support/ClaudeUsage/`. En ambos casos:
 
-- `config.json` — perfiles y preferencias (tema, colores, alertas). Es por computadora: cualquier ejecución de la app lee y escribe este mismo archivo.
+- `config.json` — perfiles (con su servicio) y preferencias (tema, colores, alertas). Es por computadora: cualquier ejecución de la app lee y escribe este mismo archivo.
 - `alert-state.json` — estado interno de las alertas (qué se notificó y cuándo). Se puede borrar sin perder configuración.
 - `budgets/<session-id>.json` — el techo de cada sesión que fijó uno. Borrar el archivo equivale a `/usage-budget off` en esa sesión. Los que quedan de sesiones muertas se barren solos a los 7 días.
 - `usage-cache-<cuenta>.json` — la última cifra de uso que leyó el hook, una por cuenta. Machine-written y descartable: sin esto, el hook haría una llamada a la API antes de cada prompt y de cada tool.

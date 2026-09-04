@@ -7,11 +7,18 @@ venv/
 env/
 
 build/
-dist/
+# `dist/*`, not `dist/`: git never descends into an ignored *directory*, so a
+# `!` exception below could not re-include anything inside it.
+dist/*
 *.spec
 
-# Built executables (dist/ already covers the normal case; this catches strays)
+# Built executables (dist/* already covers the normal case; this catches strays)
 *.exe
+
+# ...except the shipped build, which is committed on purpose so the app can be
+# downloaded and run without installing Python or a toolchain. Listed last
+# because the final matching rule wins. Rebuild it with `python build.py`.
+!dist/ClaudeUsage.exe
 
 *.log
 .DS_Store

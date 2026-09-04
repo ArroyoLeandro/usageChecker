@@ -39,6 +39,13 @@ LAYER: dict[str, int] = {
     "formatting": 1,
     "theme": 1,
     "quotas": 1,
+    # The provider adapters. L1 because `config` (L2) must ask an adapter
+    # where a profile's credentials live in order to build the profile at
+    # all -- which is also why this package may not import `requests`, and
+    # why `usage_request` returns a description of a call instead of making
+    # one. It may not import `quotas` either: both are L1, and same-layer
+    # edges are forbidden, so quota windows are plain `str` here.
+    "providers": 1,
     "config": 2,
     "icons": 2,
     "settings": 2,

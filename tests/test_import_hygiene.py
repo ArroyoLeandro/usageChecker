@@ -43,6 +43,14 @@ CLEAN_MODULES = [
     # `alerts` are both L2 and may not import each other, so the windows
     # they both name had to fall to a layer they can both reach.
     "claude_usage_tray.quotas",
+    # The adapter registry and both adapters. `requests` must stay out:
+    # `config.py` imports this package, so anything pulled in here would be
+    # pulled into every pure module that touches a profile. Codex's token
+    # refresh uses `urllib` (stdlib) for exactly this reason.
+    "claude_usage_tray.providers",
+    "claude_usage_tray.providers._types",
+    "claude_usage_tray.providers._claude",
+    "claude_usage_tray.providers._codex",
     "claude_usage_tray.config",
     "claude_usage_tray.settings",
     "claude_usage_tray.alerts",

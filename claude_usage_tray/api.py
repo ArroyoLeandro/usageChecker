@@ -1,74 +1,34 @@
-"""Lee credenciales locales de Claude Code y consulta el uso en Anthropic."""
+"""Consulta el uso de cada proveedor configurado (Claude Code, Codex, ...).
+
+This module owns everything that is the *same* for every provider: the
+per-profile response cache, the minimum fetch interval, 429 backoff with
+`Retry-After`, the 401-then-refresh-once retry, and the shape of the payload
+handed to the UI. Everything that differs -- the endpoint, the headers, where
+credentials live, how a response maps onto quota windows -- belongs to an
+adapter in `providers/` and reaches this module only through
+`profile.adapter`.
+
+That split is why adding a provider does not touch this file. It is also why
+the retry/backoff state stays keyed by config directory: two providers are
+two directories, so their rate limits can never be confused for each other's.
+"""
 
 from __future__ import annotations
 
-import json
-import os
-import re
-import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 from typing import Any
 
 import requests
 
-from . import platform
 from .config import ClaudeProfile, seed_profile
 
-API_URL_USAGE = "https://api.anthropic.com/api/oauth/usage"
 MIN_FETCH_INTERVAL_SECONDS = 45
 BACKOFF_BASE_SECONDS = 60
 BACKOFF_MAX_SECONDS = 30 * 60
-FALLBACK_USER_AGENT = "claude-code/2.1.201"
-#: The Keychain service name Claude Code stores its credentials JSON under on
-#: macOS. Fixed by Claude Code, not by us -- it takes no config-dir suffix,
-#: which is why only the ambient default profile can read it.
-KEYCHAIN_SERVICE = "Claude Code-credentials"
 _STATE_LOCK = threading.Lock()
 _STATE_BY_PROFILE: dict[str, dict[str, Any]] = {}
-
-
-def _claude_cli_path() -> Path | None:
-    import shutil
-
-    found = shutil.which("claude")
-    if found:
-        path = Path(found)
-        if path.suffix.lower() == ".ps1":
-            for ext in (".cmd", ".exe"):
-                alt = path.with_suffix(ext)
-                if alt.is_file():
-                    return alt
-        return path
-
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        for name in ("claude.cmd", "claude.exe"):
-            candidate = Path(appdata) / "npm" / name
-            if candidate.is_file():
-                return candidate
-    return None
-
-
-def _cli_version() -> str:
-    cli = _claude_cli_path()
-    if not cli or not cli.is_file():
-        return FALLBACK_USER_AGENT.removeprefix("claude-code/")
-
-    try:
-        proc = subprocess.run(
-            [str(cli), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            creationflags=platform.subprocess_flags(),
-        )
-        match = re.match(r"(\d+\.\d+\.\d+)", proc.stdout.strip())
-        return match.group(1) if match else FALLBACK_USER_AGENT.removeprefix("claude-code/")
-    except Exception:
-        return FALLBACK_USER_AGENT.removeprefix("claude-code/")
 
 
 def _profile_key(profile: ClaudeProfile) -> str:
@@ -89,133 +49,52 @@ def _profile_state(profile: ClaudeProfile) -> dict[str, Any]:
         )
 
 
-def _read_credentials_blob(profile: ClaudeProfile) -> str | None:
-    """The raw credentials JSON for `profile`, from wherever this OS keeps it.
-
-    The file comes first and always wins: it is per-profile, so a user who
-    points a profile at a copied `.claude` directory gets that profile's
-    token, and a WSL directory mounted on a Mac keeps working.
-
-    The Keychain is the fallback, and only for the ambient default profile.
-    Claude Code on macOS writes no `.credentials.json` at all -- the blob
-    lives in the login Keychain under a single, fixed service name, with no
-    room for a config-dir qualifier. So it can only answer for the one
-    profile that *is* the ambient default; letting any other profile fall
-    back to it would make every macOS profile silently report the default
-    account's usage, which is worse than reporting no session at all.
-    """
-    try:
-        if profile.credentials_path.exists():
-            return profile.credentials_path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    if profile.is_ambient_default:
-        return platform.read_secret(KEYCHAIN_SERVICE)
-    return None
-
-
 def read_access_token(profile: ClaudeProfile | None = None) -> str | None:
+    """The stored access token for `profile`, via its adapter.
+
+    Kept as a public function because callers outside this module use it as a
+    cheap "is there a session at all?" probe. It no longer knows the shape of
+    any credentials file -- nor *where* the file is, which stopped being a
+    universal fact the moment macOS entered the picture: Claude Code writes no
+    `.credentials.json` there and keeps the blob in the login Keychain
+    instead. That reconciliation is the Claude adapter's, since the Keychain
+    entry is Claude Code's and no other provider has one.
+    """
     profile = profile or seed_profile()
     if profile is None:
         return None
-    blob = _read_credentials_blob(profile)
-    if not blob:
+    reader = getattr(profile.adapter, "access_token", None)
+    if reader is None:
         return None
     try:
-        creds = json.loads(blob)
-    except json.JSONDecodeError:
+        return reader(profile.config_dir)
+    except Exception:
         return None
-    if not isinstance(creds, dict):
-        return None
-    return creds.get("claudeAiOauth", {}).get("accessToken") or None
 
 
 def refresh_token(profile: ClaudeProfile | None = None) -> bool:
+    """Ask the adapter to renew an expired session in place.
+
+    The pre-adapter version gated this on `profile.supports_refresh` and then
+    shelled out to `claude update`. Both halves moved into the adapter: only
+    it knows whether refreshing is even possible for a given directory, and
+    the mechanism differs per provider (a subprocess for Claude, an OAuth
+    round trip for Codex).
+    """
     profile = profile or seed_profile()
-    if profile is None or not profile.supports_refresh:
-        return False
-    cli = _claude_cli_path()
-    if not cli or not cli.is_file():
+    if profile is None:
         return False
     try:
-        proc = subprocess.run(
-            [str(cli), "update"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            creationflags=platform.subprocess_flags(),
-        )
-        return proc.returncode == 0
+        return bool(profile.adapter.refresh_credentials(profile.config_dir))
     except Exception:
         return False
 
 
-def _headers(profile: ClaudeProfile | None = None) -> dict[str, str] | None:
-    token = read_access_token(profile)
-    if not token:
+def _usage_request(profile: ClaudeProfile):
+    try:
+        return profile.adapter.usage_request(profile.config_dir)
+    except Exception:
         return None
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": f"claude-code/{_cli_version()}",
-        "anthropic-beta": "oauth-2025-04-20",
-    }
-
-
-def _quota(data: dict[str, Any], field: str) -> dict[str, Any] | None:
-    entry = data.get(field)
-    if not isinstance(entry, dict):
-        return None
-    if entry.get("utilization") is None:
-        return None
-    return entry
-
-
-def _model_slug(display_name: str) -> str:
-    cleaned = "".join(char if char.isalnum() else " " for char in display_name.lower())
-    return "_".join(cleaned.split())
-
-
-def _merge_scoped_limits(data: dict[str, Any]) -> dict[str, Any]:
-    limits = data.get("limits")
-    if not isinstance(limits, list):
-        return data
-
-    reset_to_field: dict[str, str] = {}
-    for key, value in data.items():
-        if isinstance(value, dict) and value.get("utilization") is not None:
-            resets_at = value.get("resets_at")
-            if resets_at:
-                reset_to_field.setdefault(resets_at, key)
-
-    group_prefix: dict[str, str] = {}
-    for limit in limits:
-        if not isinstance(limit, dict) or limit.get("scope"):
-            continue
-        group = limit.get("group")
-        resets_at = limit.get("resets_at")
-        if group and resets_at and resets_at in reset_to_field:
-            group_prefix.setdefault(group, reset_to_field[resets_at])
-
-    merged = dict(data)
-    for limit in limits:
-        if not isinstance(limit, dict):
-            continue
-        model = (limit.get("scope") or {}).get("model") or {}
-        display_name = model.get("display_name")
-        prefix = group_prefix.get(limit.get("group"))
-        if not display_name or not prefix:
-            continue
-
-        field = f"{prefix}_{_model_slug(display_name)}"
-        if merged.get(field) is not None:
-            continue
-        merged[field] = {
-            "utilization": float(limit.get("percent") or 0),
-            "resets_at": limit.get("resets_at"),
-        }
-
-    return merged
 
 
 def _now_utc() -> datetime:
@@ -383,16 +262,29 @@ def fetch_usage(
     try_refresh: bool = True,
     force: bool = False,
 ) -> dict[str, Any]:
+    """One profile's usage, normalized by its adapter.
+
+    The control flow -- cache, backoff, refresh-once on 401 -- is identical
+    for every provider and stays here; only the request and the response
+    mapping are delegated. Error copy names the provider (`Abri OpenAI Codex`
+    rather than a hardcoded `Abri Claude`) so a signed-out Codex profile does
+    not tell the user to sign in to the wrong application.
+    """
     profile = profile or seed_profile()
     if profile is None:
         return {
-            "error": "No se detecto ninguna carpeta de configuracion de Claude. Agrega un perfil manualmente.",
+            "error": "No se detecto ninguna carpeta de configuracion. Agrega un perfil manualmente.",
             "auth_error": True,
         }
-    headers = _headers(profile)
-    if not headers:
+
+    adapter = profile.adapter
+    request = _usage_request(profile)
+    if request is None:
         return {
-            "error": f"No hay una sesion iniciada para {profile.name}. Abri Claude e inicia sesion para ver el uso.",
+            "error": (
+                f"No hay una sesion iniciada para {profile.name}. "
+                f"Abri {adapter.display_name} e inicia sesion para ver el uso."
+            ),
             "auth_error": True,
         }
 
@@ -406,32 +298,26 @@ def fetch_usage(
             return cached
 
     try:
-        resp = requests.get(API_URL_USAGE, headers=headers, timeout=10)
+        resp = requests.get(request.url, headers=request.headers, timeout=10)
         if resp.status_code == 401 and try_refresh and refresh_token(profile):
-            headers = _headers(profile)
-            if headers:
-                resp = requests.get(API_URL_USAGE, headers=headers, timeout=10)
+            # Re-ask the adapter rather than reusing `request`: a refresh
+            # rewrites the credentials file, so the new token is only visible
+            # through a fresh read.
+            retried = _usage_request(profile)
+            if retried is not None:
+                resp = requests.get(retried.url, headers=retried.headers, timeout=10)
 
         resp.raise_for_status()
-        data = _merge_scoped_limits(resp.json())
-        session = _quota(data, "five_hour")
-        weekly = _quota(data, "seven_day")
-        weekly_fable = _quota(data, "seven_day_fable")
-        return _store_success(
-            profile,
-            {
-                "session": session,
-                "weekly": weekly,
-                "weekly_fable": weekly_fable,
-                "raw": data,
-            },
-            now,
-        )
+        payload = adapter.normalize(resp.json())
+        return _store_success(profile, payload, now)
     except requests.HTTPError as exc:
         code = exc.response.status_code if exc.response is not None else 0
         if code == 401:
             return {
-                "error": "La sesion vencio. Abri Claude y volve a iniciar sesion para actualizar el uso.",
+                "error": (
+                    f"La sesion vencio. Abri {adapter.display_name} y volve a "
+                    "iniciar sesion para actualizar el uso."
+                ),
                 "auth_error": True,
             }
         if code == 429:

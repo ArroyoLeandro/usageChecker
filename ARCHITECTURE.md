@@ -13,6 +13,7 @@ por la que hay muchos archivos chicos en vez de un `app.py` gigante.
 | 1 | `paths.py` | Ubicación de los archivos en disco (`%APPDATA%\ClaudeUsage\` en Windows, `~/Library/Application Support/ClaudeUsage/` en macOS) y de los recursos empaquetados. |
 | 1 | `jsonstore.py` | Lectura/escritura de JSON de forma atómica (temp + rename) y manejo de archivos corruptos. |
 | 1 | `theme.py` | Paletas de color (oscuro/claro) y fuentes por rol. |
+| 1 | `providers/` | Un adapter por CLI (Claude Code, Codex, ...). Sabe dónde viven las credenciales, qué request hace falta para leer el uso y cómo mapear la respuesta a las ventanas de cuota compartidas. **Es la única capa que conoce un servicio concreto.** |
 | 1 | `quotas.py` | Nombres de las ventanas de cuota (`session`, `weekly`, `weekly_fable`) y sus etiquetas. Fuente única para que el tooltip, el popup y las alertas llamen a cada cuota igual. |
 | 1 | `formatting.py` | Convierte datos crudos en texto para mostrar (porcentajes, fechas, tooltip). Sin dependencias de UI. |
 | 2 | `config.py` | Modelo de perfiles: alta, edición, reordenamiento, borrado, identidad estable por `id`, semilla de primer arranque. |
@@ -21,7 +22,7 @@ por la que hay muchos archivos chicos en vez de un `app.py` gigante.
 | 2 | `budget.py` | El techo de uso que un agente no debe pasar: cuál es el porcentaje que manda, la política pura de permitir / avisar / bloquear, y el store por sesión (`CLAUDE_CODE_SESSION_ID`). |
 | 2 | `icons.py` | Dibuja el icono de la bandeja y de la ventana con los colores del tema actual. |
 | 2 | `logging_setup.py` | Configura el log a `%APPDATA%\ClaudeUsage\claude-usage.log` y captura excepciones no manejadas (clave con `--windowed`, que descarta la consola). |
-| 3 | `api.py` | Habla con la API de uso de Anthropic y maneja backoff / rate limiting. |
+| 3 | `api.py` | Ejecuta el pedido que arma el adapter y maneja cache, backoff y rate limiting. Es agnóstico del proveedor. |
 | 3 | `accounts.py` | De qué instalación de Claude se informa cuando no hay un usuario a quien preguntarle. Lee `CLAUDE_CONFIG_DIR`. |
 | 4 | `ui/` | Todas las ventanas. Ver abajo. |
 | 5 | `app.py` | El orquestador: arma el menú de la bandeja, la cola de UI, el loop de polleo y conecta todo. No contiene lógica de negocio ni construcción de widgets. |
@@ -145,6 +146,77 @@ con dependencias hacia abajo hace que:
   como funciones nuevas del seam, sin tocar la lógica de dominio ni la UI.
 - Un cambio de comportamiento tenga un hogar obvio en vez de sumar líneas a un
   archivo que ya nadie podía revisar.
+
+## `providers/`
+
+Cada proveedor es un módulo con un singleton `PROVIDER` y una línea en
+`providers/__init__._REGISTRY`. Nada más en el proyecto nombra un proveedor:
+`api.py` despacha vía `profile.adapter`, `config.py` le pregunta al adapter
+dónde están las credenciales, y la ventana de perfiles dibuja un radio button
+por cada entrada de `all_providers()`.
+
+| Módulo | Qué es |
+|---|---|
+| `_types.py` | El contrato (`Provider`) y los helpers de normalización. |
+| `_claude.py` | Anthropic: `api.anthropic.com/api/oauth/usage`, refresh vía `claude update`, y la sesión en `.credentials.json` o en el llavero (ver abajo). |
+| `_codex.py` | OpenAI Codex: `~/.codex/auth.json`, `chatgpt.com/backend-api/codex/usage`, refresh OAuth propio. |
+
+### Cómo se agrega uno nuevo
+
+1. Crear `providers/_<nombre>.py` con una clase que cumpla `Provider` y
+   exponer `PROVIDER = MiProvider()`.
+2. Registrarlo en `_REGISTRY`.
+3. Agregar su variable de entorno a `PROVIDER_HOME_ENV` en `tests/conftest.py`,
+   para que el aislamiento de tests siga siendo completo.
+
+Los tests de contrato de `tests/test_providers.py` corren automáticamente
+contra el adapter nuevo: shape del payload, tolerancia a respuestas raras,
+ventanas declaradas y manejo de credenciales ausentes o corruptas.
+
+### Por qué el adapter no hace el request
+
+`usage_request()` devuelve una *descripción* del GET en vez de ejecutarlo.
+`config.py` (L2) importa `providers` para saber dónde viven las credenciales,
+así que este paquete tiene que quedar en L1 y sin `requests` — si no, todo
+módulo puro que toca un perfil arrastraría la capa de red
+(`tests/test_import_hygiene.py`). Como efecto secundario, el cache, el backoff
+y el reintento por 401 se escriben una sola vez en `api.py` en vez de una vez
+por proveedor.
+
+### Por qué el llavero de macOS vive acá adentro
+
+Claude Code en macOS no escribe `.credentials.json`: guarda el mismo JSON en
+el llavero, bajo un nombre de servicio fijo. Esa lectura es del adapter de
+Claude y no de `api.py`, por dos razones que se refuerzan.
+
+La primera es de pertenencia: la entrada del llavero es de Claude Code, con el
+nombre de Claude Code, y ningún otro proveedor tiene una. Ponerla en la capa
+agnóstica sería hacer que un módulo que no debe nombrar proveedores cargue con
+la rareza de almacenamiento de uno solo.
+
+La segunda es que arriba el arreglo quedaba a medias. Las credenciales se leen
+**dos** veces: una para contestar "¿hay sesión?" y otra para armar el header
+`Authorization` del pedido de uso. Un fallback que sólo cubriera la primera
+dejaba la bandeja diciendo "sesión iniciada" y sin números para siempre.
+
+De ahí sale la regla que el adapter codifica en `_is_ambient`: la entrada del
+llavero es **una sola** y no distingue carpetas, así que sólo puede contestar
+por el perfil que apunta al `~/.claude` de la máquina. Cualquier otro perfil en
+Mac muestra "sin sesión" salvo que su carpeta tenga su propio
+`.credentials.json` (una `.claude` de WSL montada, por ejemplo). La alternativa
+—que todos los perfiles del Mac reporten la cuenta principal con nombres
+distintos— es dato equivocado presentado con confianza, que es peor que la
+ausencia de dato. El archivo, cuando existe, siempre gana; y un archivo que
+existe pero no se puede leer es una falla real, no una invitación a preguntarle
+al llavero.
+
+### Por qué Codex no agregó ventanas de cuota nuevas
+
+La ventana `primary` de Codex es de 5 horas y la `secondary` de 7 días, o sea
+exactamente `session` y `weekly`. Reusar esos ids hace que el tooltip, el
+popup, las alertas, el budget y el reporte MCP muestren un perfil de Codex sin
+un solo cambio. `weekly_fable` queda en `None`, que es el mismo caso que una
+cuenta de Claude sin Fable, ya soportado en todos lados.
 
 ## macOS: quién corre el event loop
 

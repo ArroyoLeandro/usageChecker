@@ -46,13 +46,12 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Callable
 
-from .. import paths, platform
+from .. import paths, platform, providers
 from ..config import (
     ClaudeProfile,
     DuplicateConfigDirError,
     ProfileNotFoundError,
     add_profile,
-    default_claude_dir,
     delete_profile,
     edit_profile,
     reorder_profiles,
@@ -73,9 +72,56 @@ OnRerender = Callable[[list[ClaudeProfile], "str | None"], None]
 
 
 def _profile_status_text(profile: ClaudeProfile) -> str:
+    """The status line under a profile's name.
+
+    Names the provider in both branches. With two accounts listed, "Hace
+    falta iniciar sesion" alone does not say *which* application to open, and
+    the two are signed into separately.
+    """
+    label = providers.display_name(profile.provider)
+    if not providers.is_known(profile.provider):
+        # A config written by a newer build. `providers.get` reads it as the
+        # default so the tray still runs, but saying so is better than
+        # silently mislabelling the row as Claude.
+        return f"Proveedor desconocido ({profile.provider}); se lee como {label}"
     if profile.credentials_path.exists():
-        return "Listo para consultar el uso"
-    return "Hace falta iniciar sesion en esta carpeta"
+        return f"{label}: listo para consultar el uso"
+    return f"{label}: hace falta iniciar sesion en esta carpeta"
+
+
+def _provider_selector(
+    parent: tk.Frame,
+    theme: Theme,
+    *,
+    bg: str,
+    initial: str,
+) -> tk.StringVar:
+    """Radio buttons, one per registered adapter.
+
+    Rendered from `providers.all_providers()` rather than a hardcoded pair,
+    so a new adapter appears here the moment it is registered -- this window
+    never learns a provider's name.
+    """
+    palette = theme.palette
+    variable = tk.StringVar(value=initial)
+    row = tk.Frame(parent, bg=bg)
+    row.pack(fill="x", pady=(2, 0))
+    for adapter in providers.all_providers():
+        tk.Radiobutton(
+            row,
+            text=adapter.display_name,
+            value=adapter.id,
+            variable=variable,
+            bg=bg,
+            fg=palette.fg,
+            selectcolor=palette.panel,
+            activebackground=bg,
+            activeforeground=palette.fg,
+            highlightthickness=0,
+            borderwidth=0,
+            font=theme.font("small"),
+        ).pack(side="left", padx=(0, 12))
+    return variable
 
 
 def _open_in_explorer(target: Path, parent: tk.Misc) -> None:
@@ -161,14 +207,19 @@ def _build_edit_row(
     theme: Theme,
     window: tk.Misc,
     *,
-    on_save: Callable[[str, str], None],
+    on_save: Callable[[str, str, str], None],
     on_cancel: Callable[[], None],
 ) -> None:
     palette = theme.palette
 
-    tk.Label(row, text="Nombre", bg=palette.bg, fg=palette.muted, font=theme.font("small"), anchor="w").pack(
+    tk.Label(row, text="Servicio", bg=palette.bg, fg=palette.muted, font=theme.font("small"), anchor="w").pack(
         fill="x"
     )
+    provider_var = _provider_selector(row, theme, bg=palette.bg, initial=profile.provider)
+
+    tk.Label(
+        row, text="Nombre", bg=palette.bg, fg=palette.muted, font=theme.font("small"), anchor="w"
+    ).pack(fill="x", pady=(8, 0))
     name_var = tk.StringVar(value=profile.name)
     tk.Entry(
         row,
@@ -183,7 +234,12 @@ def _build_edit_row(
     ).pack(fill="x", ipady=4, pady=(2, 6))
 
     tk.Label(
-        row, text="Carpeta de Claude", bg=palette.bg, fg=palette.muted, font=theme.font("small"), anchor="w"
+        row,
+        text=providers.get(profile.provider).config_dir_label,
+        bg=palette.bg,
+        fg=palette.muted,
+        font=theme.font("small"),
+        anchor="w",
     ).pack(fill="x")
     path_var = tk.StringVar(value=str(profile.config_dir))
     path_row = tk.Frame(row, bg=palette.bg)
@@ -216,7 +272,7 @@ def _build_edit_row(
     _button(
         actions,
         "Guardar",
-        lambda: on_save(name_var.get(), path_var.get()),
+        lambda: on_save(name_var.get(), path_var.get(), provider_var.get()),
         theme=theme,
         bg=palette.accent,
         fg=palette.fg,
@@ -288,11 +344,13 @@ def build_profiles_content(
         ids[index], ids[target] = ids[target], ids[index]
         apply_change(reorder_profiles(profiles, ids))
 
-    def handle_edit_submit(profile: ClaudeProfile, name: str, raw_path: str) -> None:
+    def handle_edit_submit(profile: ClaudeProfile, name: str, raw_path: str, provider: str) -> None:
         raw_path = raw_path.strip()
         config_dir = Path(raw_path) if raw_path else None
         try:
-            updated = edit_profile(profiles, profile.id, name=name, config_dir=config_dir)
+            updated = edit_profile(
+                profiles, profile.id, name=name, config_dir=config_dir, provider=provider
+            )
         except DuplicateConfigDirError:
             messagebox.showinfo("Perfil", "Esa carpeta ya esta agregada.", parent=window)
             return
@@ -303,7 +361,7 @@ def build_profiles_content(
 
     tk.Label(
         parent,
-        text="Agrega otros perfiles de Claude para ver su uso en un solo lugar.",
+        text="Agrega perfiles de Claude Code y de Codex para ver todo el uso en un solo lugar.",
         bg=palette.panel,
         fg=palette.muted,
         font=theme.font("body"),
@@ -323,7 +381,9 @@ def build_profiles_content(
                 profile,
                 theme,
                 window,
-                on_save=lambda name, path, p=profile: handle_edit_submit(p, name, path),
+                on_save=lambda name, path, provider, p=profile: handle_edit_submit(
+                    p, name, path, provider
+                ),
                 on_cancel=lambda: on_rerender(profiles, None),
             )
         else:
@@ -354,6 +414,11 @@ def build_profiles_content(
     name_var = tk.StringVar()
     path_var = tk.StringVar()
 
+    tk.Label(
+        form, text="Servicio", bg=palette.panel, fg=palette.muted, font=theme.font("small"), anchor="w"
+    ).pack(fill="x", pady=(10, 0))
+    provider_var = _provider_selector(form, theme, bg=palette.panel, initial=providers.DEFAULT_ID)
+
     tk.Label(form, text="Nombre", bg=palette.panel, fg=palette.muted, font=theme.font("small"), anchor="w").pack(
         fill="x", pady=(10, 0)
     )
@@ -369,23 +434,49 @@ def build_profiles_content(
         highlightcolor=palette.accent,
     ).pack(fill="x", ipady=5)
 
-    tk.Label(
-        form, text="Carpeta de Claude", bg=palette.panel, fg=palette.muted, font=theme.font("small"), anchor="w"
-    ).pack(fill="x", pady=(10, 0))
-
-    tk.Label(
+    path_label = tk.Label(
         form,
-        text=(
-            "Elegí la carpeta donde Claude guarda tu sesion.\n"
-            "Suele verse como: C:/Users/TU_USUARIO/.claude  o  \\\\wsl.localhost\\Ubuntu\\home\\TU_USUARIO\\.claude"
-        ),
+        text=providers.get(providers.DEFAULT_ID).config_dir_label,
+        bg=palette.panel,
+        fg=palette.muted,
+        font=theme.font("small"),
+        anchor="w",
+    )
+    path_label.pack(fill="x", pady=(10, 0))
+
+    path_hint = tk.Label(
+        form,
+        text=providers.get(providers.DEFAULT_ID).config_dir_hint,
         bg=palette.panel,
         fg=palette.muted,
         font=theme.font("small"),
         wraplength=420,
         justify="left",
         anchor="w",
-    ).pack(fill="x", pady=(4, 0))
+    )
+    path_hint.pack(fill="x", pady=(4, 0))
+
+    def sync_provider_copy(*_: object) -> None:
+        """Retarget the folder field when the selected service changes.
+
+        The label and the hint both name a specific provider's directory, so
+        leaving them on Claude while the radio says Codex would walk the user
+        into pasting the wrong folder -- which `add_profile` would accept,
+        since it validates uniqueness, not contents.
+
+        The path entry itself is only overwritten while it still holds some
+        provider's suggested default: silently discarding a path the user
+        typed by hand would be a worse failure than stale copy.
+        """
+        adapter = providers.get(provider_var.get())
+        path_label.configure(text=adapter.config_dir_label)
+        path_hint.configure(text=adapter.config_dir_hint)
+        current = path_var.get().strip()
+        suggestions = {str(other.default_config_dir()) for other in providers.all_providers()}
+        if not current or current in suggestions:
+            path_var.set(str(adapter.default_config_dir()))
+
+    provider_var.trace_add("write", sync_provider_copy)
 
     path_row = tk.Frame(form, bg=palette.panel)
     path_row.pack(fill="x", pady=(8, 0))
@@ -421,7 +512,7 @@ def build_profiles_content(
     _button(
         helpers,
         "Usar el perfil actual",
-        lambda: path_var.set(str(default_claude_dir())),
+        lambda: path_var.set(str(providers.get(provider_var.get()).default_config_dir())),
         theme=theme,
         bg=palette.panel,
         fg=palette.muted,
@@ -434,7 +525,7 @@ def build_profiles_content(
     _button(
         helpers,
         "Abrir carpeta",
-        lambda: _open_in_explorer(default_claude_dir(), window),
+        lambda: _open_in_explorer(providers.get(provider_var.get()).default_config_dir(), window),
         theme=theme,
         bg=palette.panel,
         fg=palette.muted,
@@ -453,11 +544,16 @@ def build_profiles_content(
             messagebox.showerror("Perfil", "Ingresá un nombre visible para el perfil.", parent=window)
             return
         raw_path = path_var.get().strip()
+        adapter = providers.get(provider_var.get())
         if not raw_path:
-            messagebox.showerror("Perfil", "Elegí una carpeta valida de Claude.", parent=window)
+            messagebox.showerror(
+                "Perfil", f"Elegi una carpeta valida de {adapter.display_name}.", parent=window
+            )
             return
         try:
-            updated = add_profile(profiles, name=name, config_dir=Path(raw_path))
+            updated = add_profile(
+                profiles, name=name, config_dir=Path(raw_path), provider=adapter.id
+            )
         except DuplicateConfigDirError:
             messagebox.showinfo("Perfil", "Esa carpeta ya esta agregada.", parent=window)
             return
