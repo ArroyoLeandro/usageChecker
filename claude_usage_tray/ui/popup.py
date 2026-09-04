@@ -7,6 +7,13 @@ to close over. The click-outside-to-dismiss half that used to bind/unbind global
 now goes through a `DismissManager` (see `dismiss.py`) instead of directly
 calling `root.bind_all`/`unbind_all` -- see design.md's dismiss decision for
 why.
+
+Its three buttons -- close, "Perfiles", refresh -- were the last hand-rolled
+`tk.Button`s in the app, carrying a copy of the flat-button option block
+`widgets.button` already owned. They now go through that factory like every
+other button. That was not cosmetic: this is the window the user actually
+looks at, and on macOS those three rendered as native grey pills on the dark
+panel no matter what colours they were handed.
 """
 
 from __future__ import annotations
@@ -19,7 +26,7 @@ from .. import formatting, platform
 from ..config import ClaudeProfile
 from ..theme import DEFAULT_THEME, Theme
 from .dismiss import DismissManager
-from .widgets import apply_window_icon, create_progress_row
+from .widgets import apply_window_icon, button, create_progress_row
 
 WINDOW_TITLE = "ClaudeUsage — Uso Claude"
 
@@ -180,21 +187,14 @@ def show_popup(
         anchor="w",
     ).pack(side="left")
 
-    tk.Button(
+    button(
         header,
-        text="×",
-        command=popup.destroy,
+        "×",
+        popup.destroy,
+        theme=theme,
         bg=palette.panel,
         fg=palette.muted,
-        activebackground=palette.panel,
-        activeforeground=palette.fg,
-        bd=0,
-        padx=4,
-        pady=0,
-        font=theme.font("title"),
-        highlightthickness=0,
-        relief="flat",
-        cursor="hand2",
+        font_role="title",
     ).pack(side="right")
 
     profiles = data.get("profiles")
@@ -219,51 +219,45 @@ def show_popup(
         anchor="w",
     ).pack(side="left")
 
-    tk.Button(
+    button(
         footer,
-        text="Perfiles",
-        command=on_manage_profiles,
+        "Perfiles",
+        on_manage_profiles,
+        theme=theme,
         bg=palette.panel,
         fg=palette.muted,
-        activebackground=palette.panel,
-        activeforeground=palette.fg,
-        bd=0,
-        padx=4,
-        pady=0,
-        font=theme.font("body"),
-        highlightthickness=0,
-        relief="flat",
-        cursor="hand2",
     ).pack(side="right", padx=(0, 10))
 
-    tk.Button(
+    button(
         footer,
-        text="↻",
-        command=on_refresh,
+        "↻",
+        on_refresh,
+        theme=theme,
         bg=palette.panel,
         fg=palette.muted,
-        activebackground=palette.panel,
-        activeforeground=palette.fg,
-        bd=0,
-        padx=4,
-        pady=0,
-        font=theme.font("title"),
-        highlightthickness=0,
-        relief="flat",
-        cursor="hand2",
+        font_role="title",
     ).pack(side="right")
 
     popup.update_idletasks()
     w, h = popup.winfo_width(), popup.winfo_height()
     work_area = platform.work_area_bounds()
     if work_area is None:
+        work_top = 0
         work_right = popup.winfo_screenwidth()
         work_bottom = popup.winfo_screenheight()
     else:
+        work_top = work_area.top
         work_right, work_bottom = work_area.right, work_area.bottom
     margin_x, margin_y = 26, 12
     x = work_right - w - margin_x
-    y = work_bottom - h - margin_y
+    # Hang the popup off whichever edge the tray icon actually lives on:
+    # under the menu bar on macOS, above the taskbar on Windows and Linux.
+    # Anchoring at the bottom everywhere would, on a Mac, drop the popup at
+    # the far corner from the icon that opened it -- and on top of the Dock.
+    if platform.tray_anchor_edge() == platform.TRAY_ANCHOR_TOP:
+        y = work_top + margin_y
+    else:
+        y = work_bottom - h - margin_y
     popup.geometry(f"{w}x{h}+{x}+{y}")
 
     popup.bind("<Escape>", lambda _e: popup.destroy())

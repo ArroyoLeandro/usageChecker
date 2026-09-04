@@ -6,6 +6,14 @@ shape, the OAuth usage endpoint, the `claude-code/<version>` User-Agent, the
 per-model `limits` array into the flat `five_hour`/`seven_day` fields the
 rest of the app reads). None of that behavior changed -- it just stopped
 being the only possibility.
+
+The macOS Keychain fallback in `_oauth_blob` moved here for the same reason:
+it is Claude Code's Keychain entry, under Claude Code's fixed service name,
+and no other provider has one. Reading it from `api.py` would have made a
+provider-agnostic module carry one provider's storage quirk -- and, worse,
+would only have fixed `read_access_token`, leaving `usage_request` (which
+reads the credentials again to build the Authorization header) still looking
+for a file macOS never wrote.
 """
 
 from __future__ import annotations
@@ -23,6 +31,10 @@ from ._types import UsageRequest, quota_entry
 API_URL_USAGE = "https://api.anthropic.com/api/oauth/usage"
 FALLBACK_USER_AGENT = "claude-code/2.1.201"
 CREDENTIALS_FILENAME = ".credentials.json"
+#: The Keychain service name Claude Code stores its credentials JSON under on
+#: macOS. Fixed by Claude Code, not by us -- it takes no config-dir suffix,
+#: which is why only the ambient default directory can read it.
+KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 
 def _cli_path() -> Path | None:
@@ -65,10 +77,76 @@ def _cli_version() -> str:
         return FALLBACK_USER_AGENT.removeprefix("claude-code/")
 
 
-def _oauth_blob(config_dir: Path) -> dict[str, Any]:
+def _default_config_dir() -> Path:
+    # `CLAUDE_CONFIG_DIR` is exported by Claude Code and inherited by the
+    # processes it spawns, which is what lets the MCP server and the hooks
+    # report on the account that launched them with no configuration.
+    #
+    # Module-level rather than only a method because `_is_ambient` below runs
+    # before any adapter instance is in hand, and one definition is what keeps
+    # "the ambient directory" from meaning two things in one file.
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        return Path(os.environ["CLAUDE_CONFIG_DIR"]).expanduser()
+    return Path.home() / ".claude"
+
+
+def _is_ambient(config_dir: Path) -> bool:
+    """Whether `config_dir` is the directory the local Claude Code administers.
+
+    The same question `config.ClaudeProfile.is_ambient_default` answers, asked
+    of a bare path because an adapter never sees a profile. Two callers below
+    need it -- the Keychain fallback and `refresh_credentials` -- for the same
+    underlying reason: both reach for state belonging to whichever account the
+    local CLI is logged into, and neither can tell one config directory's
+    account from another's.
+    """
+    default = _default_config_dir()
     try:
-        creds = json.loads((config_dir / CREDENTIALS_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return config_dir.expanduser().resolve() == default.expanduser().resolve()
+    except OSError:
+        return str(config_dir).lower() == str(default).lower()
+
+
+def _read_credentials_blob(config_dir: Path) -> str | None:
+    """The raw credentials JSON for `config_dir`, from wherever this OS keeps it.
+
+    The file comes first and always wins: it is per-directory, so a user who
+    points a profile at a copied `.claude` gets that profile's token, and a
+    WSL directory mounted on a Mac keeps working.
+
+    The Keychain is the fallback, and only for the ambient default directory.
+    Claude Code on macOS writes no `.credentials.json` at all -- the blob
+    lives in the login Keychain under a single, fixed service name, with no
+    room for a config-dir qualifier. So it can only answer for the one
+    directory that *is* the ambient default; letting any other profile fall
+    back to it would make every macOS profile silently report the default
+    account's usage, which is worse than reporting no session at all.
+
+    An `OSError` on a file that *exists* is a real fault, not "nothing here,
+    try the store": falling through would answer one profile with another
+    account's token.
+    """
+    path = config_dir / CREDENTIALS_FILENAME
+    try:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if _is_ambient(config_dir):
+        return platform.read_secret(KEYCHAIN_SERVICE)
+    return None
+
+
+def _oauth_blob(config_dir: Path) -> dict[str, Any]:
+    raw = _read_credentials_blob(config_dir)
+    if not raw:
+        return {}
+    try:
+        creds = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(creds, dict):
+        # A credentials file holding a bare list would blow up on `.get`.
         return {}
     blob = creds.get("claudeAiOauth")
     return blob if isinstance(blob, dict) else {}
@@ -144,12 +222,7 @@ class ClaudeProvider:
     )
 
     def default_config_dir(self) -> Path:
-        # `CLAUDE_CONFIG_DIR` is exported by Claude Code and inherited by the
-        # processes it spawns, which is what lets the MCP server and the hooks
-        # report on the account that launched them with no configuration.
-        if os.environ.get("CLAUDE_CONFIG_DIR"):
-            return Path(os.environ["CLAUDE_CONFIG_DIR"]).expanduser()
-        return Path.home() / ".claude"
+        return _default_config_dir()
 
     def account_label(self, config_dir: Path) -> str | None:
         oauth = _oauth_blob(config_dir)
@@ -197,11 +270,7 @@ class ClaudeProvider:
         session the local CLI would refresh, so running it there would renew
         the wrong account's token and report success for it.
         """
-        try:
-            same_dir = config_dir.expanduser().resolve() == self.default_config_dir().expanduser().resolve()
-        except OSError:
-            same_dir = str(config_dir).lower() == str(self.default_config_dir()).lower()
-        if not same_dir:
+        if not _is_ambient(config_dir):
             return False
         cli = _cli_path()
         if not cli or not cli.is_file():

@@ -16,11 +16,13 @@ accounting.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .. import budget as budget_module
+from ..quotas import QUOTA_WINDOWS
 from .. import jsonstore, paths
 from ..accounts import profile_for, resolve_config_dir
 
@@ -47,7 +49,34 @@ def account_token() -> str:
     return str(resolve_config_dir().config_dir)
 
 
-def read_cached(path: Path | None = None, *, ttl_seconds: int = CACHE_TTL_SECONDS, now: datetime | None = None) -> float | None:
+def _selected_percent(raw: dict[str, Any], windows: Sequence[str] | None) -> float | None:
+    """The cached percentage for the windows a caller asked about.
+
+    Two shapes are read. The current one carries `windows` -- a mapping of
+    window name to percentage -- so a budget that watches only the weekly
+    quota is answered from the same cache entry a full report wrote. The
+    older one carries a single `used_percent`, already collapsed across all
+    windows; it is returned as-is, because a maximum is the only honest
+    answer left once the parts are gone, and a stale-shaped entry expires
+    within the TTL anyway.
+    """
+    per_window = raw.get("windows")
+    if isinstance(per_window, dict):
+        selected = tuple(windows) if windows else tuple(per_window)
+        values: list[float] = []
+        for name in selected:
+            try:
+                values.append(float(per_window[name]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return max(values) if values else None
+    try:
+        return float(raw["used_percent"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def read_cached(path: Path | None = None, *, windows: Sequence[str] | None = None, ttl_seconds: int = CACHE_TTL_SECONDS, now: datetime | None = None) -> float | None:
     """The cached percentage if it is still fresh, else None."""
     target = path or paths.usage_cache_file(account_token())
     now = now or _now()
@@ -58,9 +87,11 @@ def read_cached(path: Path | None = None, *, ttl_seconds: int = CACHE_TTL_SECOND
     if not isinstance(raw, dict):
         return None
     try:
-        used = float(raw["used_percent"])
         stamped = datetime.fromisoformat(str(raw["at"]))
     except (KeyError, TypeError, ValueError):
+        return None
+    used = _selected_percent(raw, windows)
+    if used is None:
         return None
     if stamped.tzinfo is None:
         stamped = stamped.replace(tzinfo=timezone.utc)
@@ -69,19 +100,36 @@ def read_cached(path: Path | None = None, *, ttl_seconds: int = CACHE_TTL_SECOND
     return used
 
 
-def write_cached(used_percent: float, path: Path | None = None, *, now: datetime | None = None) -> None:
+def write_cached(
+    used_percent: float,
+    path: Path | None = None,
+    *,
+    per_window: dict[str, float] | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Cache the binding percentage, and the per-window parts when known.
+
+    `used_percent` stays first and required so every existing caller is
+    unchanged. `per_window` is what lets a budget that watches only the
+    weekly quota be answered from this entry instead of the maximum across
+    all of them -- without it, a narrowed ceiling would silently read the
+    5-hour window it was told to ignore.
+    """
     target = path or paths.usage_cache_file(account_token())
+    record: dict[str, Any] = {"used_percent": used_percent, "at": (now or _now()).isoformat()}
+    if per_window:
+        record["windows"] = {str(k): float(v) for k, v in per_window.items()}
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        jsonstore.write_json_atomic(target, {"used_percent": used_percent, "at": (now or _now()).isoformat()})
+        jsonstore.write_json_atomic(target, record)
     except OSError:
         # An unwritable cache costs a round trip next time. It is not a
         # reason to fail a prompt.
         return
 
 
-def fetch_used_percent() -> float | None:
-    """Ask the API. Imported lazily -- see below."""
+def fetch_payload() -> dict[str, Any] | None:
+    """Ask the API and hand back the whole payload. Imported lazily -- see below."""
     # `api` pulls in `requests`, and through it a chunk of import time this
     # package pays on *every* hook invocation. Deferring the import to the
     # cache-miss path keeps the common case (cache hit) to stdlib only,
@@ -95,23 +143,36 @@ def fetch_used_percent() -> float | None:
     if not resolution.exists:
         return None
     payload: dict[str, Any] = api.fetch_usage(profile_for(resolution), try_refresh=False)
-    return budget_module.highest_used_percent(payload)
+    return payload
 
 
-def used_percent(*, ttl_seconds: int = CACHE_TTL_SECONDS, now: datetime | None = None) -> float | None:
+def used_percent(
+    *,
+    windows: Sequence[str] | None = None,
+    ttl_seconds: int = CACHE_TTL_SECONDS,
+    now: datetime | None = None,
+) -> float | None:
     """Cached-or-fetched binding quota percentage; None if unknown.
 
     None is the fail-open signal, and it is returned for every failure mode
     -- no session, no network, a 429, a malformed payload. `budget.evaluate`
     turns None into `allow`.
     """
-    cached = read_cached(ttl_seconds=ttl_seconds, now=now)
+    cached = read_cached(windows=windows, ttl_seconds=ttl_seconds, now=now)
     if cached is not None:
         return cached
     try:
-        fresh = fetch_used_percent()
+        payload = fetch_payload()
     except Exception:  # noqa: BLE001 -- see the fail-open note above
         return None
-    if fresh is not None:
-        write_cached(fresh, now=now)
-    return fresh
+    if payload is None:
+        return None
+    binding = budget_module.highest_used_percent(payload)
+    parts = {
+        name: value
+        for name in QUOTA_WINDOWS
+        if (value := budget_module.used_percent_for(payload, (name,))) is not None
+    }
+    if binding is not None:
+        write_cached(binding, per_window=parts or None, now=now)
+    return budget_module.used_percent_for(payload, windows) if windows else binding

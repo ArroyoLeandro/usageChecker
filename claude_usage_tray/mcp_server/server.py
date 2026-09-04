@@ -100,8 +100,7 @@ BUDGET_TOOL_INPUT_SCHEMA: dict[str, Any] = {
             "type": "number",
             "description": (
                 "Quota percentage at which further turns are blocked, 1-100. "
-                "Compared against `highest_used_percent`, so it caps whichever "
-                "window is closest to full."
+                "Compared against the windows named in `windows` -- by default every window, so it caps whichever is closest to full."
             ),
             "minimum": 1,
             "maximum": 100,
@@ -117,6 +116,18 @@ BUDGET_TOOL_INPUT_SCHEMA: dict[str, Any] = {
         "note": {
             "type": "string",
             "description": "Optional reminder of why this cap was set.",
+        },
+        "windows": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["session", "weekly", "weekly_fable"]},
+            "description": (
+                "Which quota windows the ceiling watches. Omit for all of them. "
+                "Pass [\"weekly\", \"weekly_fable\"] to cap the WEEK only and let the "
+                "5-hour window refill and be spent -- the two plans are not "
+                "interchangeable, and a weekly cap enforced against the session "
+                "window stops the account every afternoon for a quota that was "
+                "meant to be used."
+            ),
         },
         "clear": {
             "type": "boolean",
@@ -134,6 +145,7 @@ def set_budget(
     warn_margin: float | None = None,
     note: str | None = None,
     clear: bool = False,
+    windows: list[str] | None = None,
 ) -> dict[str, Any]:
     """Write, replace or remove the budget the hook reads.
 
@@ -174,6 +186,7 @@ def set_budget(
         ceiling_percent=ceiling,
         warn_margin=max(0.0, margin),
         note=note,
+        windows=budget_module.parse_windows(windows),
     )
     budget_module.save_budget(active, session_id)
     return {
@@ -183,7 +196,8 @@ def set_budget(
         "note": (
             f"Enforced from now on for this session and the subagents it launches. Work is "
             f"blocked at {active.ceiling_percent:.0f}% and a wrap-up warning starts at "
-            f"{active.warn_at:.0f}%. Other Claude sessions on this machine are unaffected."
+            f"{active.warn_at:.0f}%, measured against {', '.join(active.windows)}. "
+            f"Other Claude sessions on this machine are unaffected."
         ),
     }
 
@@ -196,6 +210,7 @@ def _budget_view(active: budget_module.Budget | None) -> dict[str, Any] | None:
         "warn_at_percent": active.warn_at,
         "warn_margin": active.warn_margin,
         "note": active.note,
+        "windows": list(active.windows),
     }
 
 
@@ -231,7 +246,13 @@ def get_usage(config_dir: str | None = None, *, force_refresh: bool = False) -> 
     active = budget_module.load_budget()
     report["budget"] = _budget_view(active)
     if active is not None:
-        decision = budget_module.evaluate(report.get("highest_used_percent"), active)
+        # The same windows the gate enforces against, so the number the agent
+        # is shown and the number that stops it cannot disagree.
+        windowed = budget_module.used_percent_for(payload, active.windows)
+        decision = budget_module.evaluate(
+            windowed if windowed is not None else report.get("highest_used_percent"),
+            active,
+        )
         report["budget_status"] = decision.action
         if decision.message:
             report["budget_message"] = decision.message
@@ -279,6 +300,7 @@ def _call_set_budget(arguments: dict[str, Any]) -> dict[str, Any]:
     return set_budget(
         arguments.get("ceiling_percent"),
         warn_margin=arguments.get("warn_margin"),
+        windows=arguments.get("windows"),
         note=arguments.get("note"),
         clear=bool(arguments.get("clear")),
     )

@@ -129,7 +129,15 @@ def _place(popup: tk.Toplevel, rect: Rect, work_area: WorkArea | None) -> None:
     which case the full screen is the only bound available.
     """
     popup.update_idletasks()
-    width, height = popup.winfo_width(), popup.winfo_height()
+    # `winfo_reqwidth/reqheight`, not `winfo_width/height`. The popup is
+    # deliberately still withdrawn here (it is placed before it is ever seen,
+    # so it cannot flash), and an unmapped window has no *actual* size yet:
+    # under Aqua Tk both accessors answer 1, so the geometry written below
+    # would pin the popup to a 1x1 window that is on screen, correctly
+    # positioned, and completely invisible. The requested size is what the
+    # geometry managers computed during `update_idletasks`, which is exactly
+    # the size the window is about to take.
+    width, height = popup.winfo_reqwidth(), popup.winfo_reqheight()
 
     if work_area is None:
         left, top = 0, 0

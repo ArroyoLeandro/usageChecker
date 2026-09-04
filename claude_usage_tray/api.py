@@ -54,7 +54,11 @@ def read_access_token(profile: ClaudeProfile | None = None) -> str | None:
 
     Kept as a public function because callers outside this module use it as a
     cheap "is there a session at all?" probe. It no longer knows the shape of
-    any credentials file -- `providers.Provider.access_token` does.
+    any credentials file -- nor *where* the file is, which stopped being a
+    universal fact the moment macOS entered the picture: Claude Code writes no
+    `.credentials.json` there and keeps the blob in the login Keychain
+    instead. That reconciliation is the Claude adapter's, since the Keychain
+    entry is Claude Code's and no other provider has one.
     """
     profile = profile or seed_profile()
     if profile is None:

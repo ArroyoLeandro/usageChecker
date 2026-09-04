@@ -83,6 +83,7 @@ from ..theme import (
     with_overrides,
 )
 from . import colors as color_model
+from .widgets import FlatButton
 from .widgets import button as _button
 
 TAB_TITLE = "Configuracion"
@@ -206,8 +207,7 @@ def _build_theme_selector(
             font_role="body_bold" if selected else "body",
             padx=14,
             pady=6,
-            highlightthickness=0 if selected else 1,
-            highlightbackground=None if selected else palette.border,
+            border=None if selected else palette.border,
         ).pack(side="left", padx=(0, 8))
 
 
@@ -234,8 +234,7 @@ def _build_font_size_control(
         font_role="body_bold",
         padx=12,
         pady=4,
-        highlightthickness=1,
-        highlightbackground=palette.border,
+        border=palette.border,
     ).pack(side="left")
 
     tk.Label(
@@ -258,8 +257,7 @@ def _build_font_size_control(
         font_role="body_bold",
         padx=12,
         pady=4,
-        highlightthickness=1,
-        highlightbackground=palette.border,
+        border=palette.border,
     ).pack(side="left")
 
     # Renders in the theme's own body font, so the number above stops being
@@ -313,7 +311,7 @@ def _build_colors_section(
     grid.pack(fill="x", pady=(8, 0))
 
     variables: dict[str, tk.StringVar] = {}
-    swatches: dict[str, tk.Button] = {}
+    swatches: dict[str, FlatButton] = {}
     # Seeded from the stored map, never from the text: a pre-filled field is
     # showing you the theme's colour, not claiming you chose it. This set is
     # the only thing `apply` is allowed to persist.
@@ -444,8 +442,7 @@ def _build_colors_section(
             font_role="small",
             padx=6,
             pady=2,
-            highlightthickness=1,
-            highlightbackground=palette.border,
+            border=palette.border,
         )
         swatch.pack(side="left", padx=(0, 6))
         swatches[row.field] = swatch
@@ -520,8 +517,7 @@ def _build_colors_section(
         fg=palette.muted,
         padx=12,
         pady=5,
-        highlightthickness=1,
-        highlightbackground=palette.border,
+        border=palette.border,
     ).pack(side="left", padx=(8, 0))
 
     refresh()
@@ -625,8 +621,7 @@ def _build_interval_control(
         font_role="body_bold",
         padx=12,
         pady=4,
-        highlightthickness=1,
-        highlightbackground=palette.border,
+        border=palette.border,
     ).pack(side="left")
 
     tk.Label(
@@ -649,8 +644,7 @@ def _build_interval_control(
         font_role="body_bold",
         padx=12,
         pady=4,
-        highlightthickness=1,
-        highlightbackground=palette.border,
+        border=palette.border,
     ).pack(side="left")
 
 
@@ -681,8 +675,7 @@ def _build_alerts_section(
             font_role="body_bold" if selected else "body",
             padx=14,
             pady=6,
-            highlightthickness=0 if selected else 1,
-            highlightbackground=None if selected else palette.border,
+            border=None if selected else palette.border,
         ).pack(side="left", padx=(0, 8))
 
     _hint(

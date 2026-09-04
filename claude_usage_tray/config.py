@@ -47,16 +47,37 @@ class ClaudeProfile:
         return providers.get(self.provider)
 
     @property
+    def is_ambient_default(self) -> bool:
+        """Whether this profile points at the machine's own directory *for its
+        own provider* -- as opposed to a second account, a copy, or a mounted
+        WSL path.
+
+        Compared against `self.adapter.default_config_dir()`, never against
+        Claude's: a Codex profile sitting in `~/.codex` is every bit as
+        ambient as a Claude profile sitting in `~/.claude`, and measuring it
+        against Claude would report it as foreign forever.
+
+        It carries its own name because the condition is read in two
+        registers -- "may I renew this session?" just below, and "is this the
+        directory the local CLI administers?" inside the adapters, which is
+        what gates Claude's macOS Keychain fallback and its `claude update`
+        refresh. The adapters cannot call this property (they are handed a
+        bare `Path`, not a profile) so they repeat the comparison; what does
+        not get repeated is the criterion.
+        """
+        return _paths_equal(self.config_dir, self.adapter.default_config_dir())
+
+    @property
     def supports_refresh(self) -> bool:
         """Derived, never stored. True iff `config_dir` is the ambient
-        default Claude directory -- see profile-management spec,
-        "supports_refresh Is Derived". Computed fresh on every read so an
+        default directory of this profile's provider -- see profile-management
+        spec, "supports_refresh Is Derived". Computed fresh on every read so an
         edited `config_dir` immediately reflects the correct value; the old
         code hardcoded this to `True` for the one profile whose `config_dir`
         could never change, which made the hardcode tautologically safe.
         Editable paths (this slice's feature) make that assumption false.
         """
-        return _paths_equal(self.config_dir, self.adapter.default_config_dir())
+        return self.is_ambient_default
 
 
 @dataclass(frozen=True)

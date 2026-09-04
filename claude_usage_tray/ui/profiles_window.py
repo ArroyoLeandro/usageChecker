@@ -65,7 +65,10 @@ OnProfilesChanged = Callable[[list[ClaudeProfile]], None]
 OnWindowSizeChanged = Callable[[str], None]
 
 # Ask the owning window for a fresh tree: `(profiles, editing_id)`.
-OnRerender = Callable[[list[ClaudeProfile], str | None], None]
+# The `str | None` is quoted, as in `hover.py`: a type alias is an ordinary
+# assignment evaluated at import time, so `from __future__ import annotations`
+# does not defer it and the PEP 604 union is a hard error before 3.10.
+OnRerender = Callable[[list[ClaudeProfile], "str | None"], None]
 
 
 def _profile_status_text(profile: ClaudeProfile) -> str:
@@ -261,8 +264,7 @@ def _build_edit_row(
         theme=theme,
         bg=palette.bg,
         fg=palette.fg,
-        highlightthickness=1,
-        highlightbackground=palette.border,
+        border=palette.border,
     ).pack(side="left", padx=(8, 0))
 
     actions = tk.Frame(row, bg=palette.bg)
@@ -287,8 +289,7 @@ def _build_edit_row(
         fg=palette.muted,
         padx=8,
         pady=4,
-        highlightthickness=1,
-        highlightbackground=palette.border,
+        border=palette.border,
     ).pack(side="left", padx=(8, 0))
 
 
@@ -502,8 +503,7 @@ def build_profiles_content(
         bg=palette.bg,
         fg=palette.fg,
         padx=10,
-        highlightthickness=1,
-        highlightbackground=palette.border,
+        border=palette.border,
     ).pack(side="left", padx=(8, 0))
 
     helpers = tk.Frame(form, bg=palette.panel)
@@ -519,8 +519,7 @@ def build_profiles_content(
         font_role="small",
         padx=8,
         pady=4,
-        highlightthickness=1,
-        highlightbackground=palette.border,
+        border=palette.border,
     ).pack(side="left")
 
     _button(
@@ -533,8 +532,7 @@ def build_profiles_content(
         font_role="small",
         padx=8,
         pady=4,
-        highlightthickness=1,
-        highlightbackground=palette.border,
+        border=palette.border,
     ).pack(side="left", padx=(8, 0))
 
     actions = tk.Frame(form, bg=palette.panel)

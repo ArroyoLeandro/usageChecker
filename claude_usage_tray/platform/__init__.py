@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
-from ._types import FileManagerError, PlatformUnsupportedError, Rect, WorkArea
+from ._types import FileManagerError, PlatformUnsupportedError, Rect, TrayHandle, WorkArea
 
 IS_WINDOWS = sys.platform == "win32"
 _IS_DARWIN = sys.platform == "darwin"
@@ -41,6 +42,7 @@ __all__ = [
     "PlatformUnsupportedError",
     "FileManagerError",
     "Rect",
+    "TrayHandle",
     "WorkArea",
     "set_app_user_model_id",
     "subprocess_flags",
@@ -51,9 +53,24 @@ __all__ = [
     "set_startup_enabled",
     "app_data_root",
     "tray_hover_supported",
+    "tray_handle_attribute",
     "tray_icon_rect",
     "cursor_position",
+    "read_secret",
+    "tray_requires_host_event_loop",
+    "tray_anchor_edge",
+    "bind_tray_click",
+    "bind_tray_hidpi_image",
+    "TRAY_ANCHOR_TOP",
+    "TRAY_ANCHOR_BOTTOM",
 ]
+
+#: The screen edge the tray/menu-bar icon lives on. Windows and Linux put it
+#: at the bottom (taskbar/system tray); macOS puts it at the top (menu bar).
+#: Named constants rather than bare strings so a typo is an AttributeError at
+#: import time instead of a window that silently opens on the wrong edge.
+TRAY_ANCHOR_TOP = "top"
+TRAY_ANCHOR_BOTTOM = "bottom"
 
 
 def set_app_user_model_id(app_id: str) -> None:
@@ -111,24 +128,145 @@ def app_data_root() -> Path:
 
 def tray_hover_supported() -> bool:
     """Whether this platform can report a tray icon's screen rectangle, and
-    therefore whether hovering over it can be detected at all. `False`
-    everywhere but Windows — the caller keeps the native tooltip there."""
+    therefore whether hovering over it can be detected at all.
+
+    `True` on Windows (`Shell_NotifyIconGetRect`) and on macOS (the status
+    item's own `NSStatusBarWindow` knows its frame). `False` on Linux, where
+    there is no tray model this app targets — the caller keeps the native
+    tooltip there."""
     return _backend.tray_hover_supported()
 
 
-def tray_icon_rect(hwnd: int, uid: int = 0) -> Rect | None:
-    """Return the screen rectangle of the notify icon identified by
-    (`hwnd`, `uid`), or `None` when it cannot be determined — including the
-    ordinary case of an icon hidden in the taskbar overflow.
+def tray_handle_attribute() -> str | None:
+    """The attribute on a `pystray.Icon` that carries this platform's tray
+    handle, or `None` where hover tracking is not available at all.
 
-    `uid=0` is the default because that is the value the hover spike measured
-    working against pystray's win32 backend. Both values are the caller's to
-    supply: this seam does OS, and digging a window handle out of a tray
-    library is not an OS fact."""
-    return _backend.tray_icon_rect(hwnd, uid)
+    `"_hwnd"` on Windows, `"_status_item"` on macOS. Both are private to
+    pystray and discovered rather than published, which is why the caller
+    reads them defensively and degrades to the native tooltip when they are
+    missing.
+
+    The seam names the attribute but does not read it: reaching into a tray
+    library is that library's business, not the OS's, and `_windows.py` is
+    deliberately stdlib-only. What *is* an OS fact is which kind of object
+    identifies an icon here — an integer window handle or an AppKit object —
+    and that is exactly what this answers."""
+    return _backend.tray_handle_attribute()
+
+
+def tray_icon_rect(handle: TrayHandle) -> Rect | None:
+    """Return the screen rectangle of the tray icon `handle` identifies, or
+    `None` when it cannot be determined — including the ordinary case of an
+    icon hidden in the taskbar overflow.
+
+    Top-left origin with y growing downward on every platform, matching Tk
+    and `cursor_position()`. macOS reports its own geometry in Cocoa
+    coordinates (bottom-left origin, y growing up) and the backend flips it,
+    so no caller has to know which convention it is holding.
+
+    Never cache the result. On macOS the menu-bar item slides horizontally
+    every time another icon appears or disappears, so a rect read once is
+    wrong within seconds; on Windows the icon moves in and out of the
+    overflow flyout. Re-read it on every poll — that is what the hover
+    tracker does.
+
+    Where `tray_requires_host_event_loop()` is `True` this call reads live
+    AppKit state and must be made on the host toolkit's event loop, the same
+    rule that governs every other write to the icon.
+    """
+    return _backend.tray_icon_rect(handle)
 
 
 def cursor_position() -> tuple[int, int] | None:
     """Return the cursor's `(x, y)` in the same coordinate space
     `tray_icon_rect` reports, or `None` where it cannot be known."""
     return _backend.cursor_position()
+
+
+def read_secret(service: str) -> str | None:
+    """Read `service` from the OS credential store, or `None`.
+
+    An "I don't know" everywhere the platform has no such store (Windows and
+    Linux here), and equally `None` when the store exists but holds no entry
+    under that name -- the caller cannot act differently on those two cases,
+    so they are not distinguished. Never raises: a missing secret is an
+    ordinary state (the user is simply not logged in yet), not a fault.
+
+    Exists because Claude Code does not store its OAuth token the same way on
+    every platform: on Windows and Linux it writes `.credentials.json` inside
+    the config dir, while on macOS it puts the same JSON blob in the login
+    Keychain and leaves no file behind. Reading a file is not an OS fact and
+    stays in `api.py`; reaching into a *platform credential store* is, and
+    belongs here.
+    """
+    return _backend.read_secret(service)
+
+
+def tray_requires_host_event_loop() -> bool:
+    """Whether the tray icon must be serviced by the GUI toolkit's own event
+    loop instead of one pystray runs on a thread of its own.
+
+    `True` on macOS: an `NSStatusItem` is an AppKit object, so it must be
+    created and updated on the main thread, and its clicks are dispatched by
+    the process's single `NSApplication` run loop -- which, under Aqua Tk, is
+    the loop `Tk.mainloop()` is already running. The caller answers this by
+    using pystray's `run_detached()` (which readies the icon without starting
+    a second loop) rather than `run()` on a background thread, and by hopping
+    every later mutation of the icon back onto the main thread.
+
+    `False` on Windows and Linux, where pystray owns a message loop of its own
+    and driving it from a background thread is the supported arrangement.
+    """
+    return _backend.tray_requires_host_event_loop()
+
+
+def tray_anchor_edge() -> str:
+    """The screen edge the tray icon sits on: `TRAY_ANCHOR_TOP` or
+    `TRAY_ANCHOR_BOTTOM`.
+
+    A window that means to appear *near the tray icon* has to know which end
+    of the work area to measure from. Every other platform here anchors at
+    the bottom, next to a taskbar; macOS anchors at the top, under the menu
+    bar. Returned as an edge rather than a coordinate because the caller also
+    needs the window's own measured height to place it, and that is a Tk fact
+    this seam has no business knowing.
+    """
+    return _backend.tray_anchor_edge()
+
+
+def bind_tray_click(status_item: Any, on_primary: Callable[[], None]) -> Any | None:
+    """Make a primary click on the tray icon invoke `on_primary` directly.
+
+    Windows gets this for free: pystray's backend honours the `default=True`
+    menu item, so a left click already runs it and this is an explicit no-op
+    returning `None`. macOS does not -- an `NSStatusItem` with a menu attached
+    hands every click to the menu -- so there the backend rewires the button
+    and re-presents the menu on secondary clicks instead.
+
+    Returns an opaque token that the caller must hold a reference to for as
+    long as the icon lives, or `None` when nothing was rewired. `None` is not
+    a failure to handle: it means the platform's own default-action handling
+    is in force, which is the correct behaviour there.
+    """
+    return _backend.bind_tray_click(status_item, on_primary)
+
+
+def bind_tray_hidpi_image(icon: Any) -> bool:
+    """Make the tray icon rasterise at the display's real pixel density.
+
+    macOS is the only platform here that needs this, and it needs it badly:
+    pystray's `NSStatusItem` image is built from a 22x22-pixel PNG and handed
+    to AppKit with no indication that it is a 1x asset, so on every Retina
+    Mac the system stretches 22 pixels across 44 and the icon is permanently
+    soft. The macOS backend corrects that by rasterising at
+    `thickness * backingScaleFactor` and declaring the image's size in
+    points. Windows and Linux return `False`: their backends hand the shell a
+    bitmap it already scales correctly, so there is nothing to correct.
+
+    Returns whether anything was installed. `False` is not a failure -- it is
+    either "this platform is already correct" or "the tray library did not
+    look the way the fix expects", and both leave a working, merely less
+    crisp, icon. The caller must repaint after a `True` (assigning
+    `icon.icon` back to itself suffices) for the sharper image to appear.
+    """
+    return _backend.bind_tray_hidpi_image(icon)

@@ -1,16 +1,16 @@
 # Claude Usage
 
-App de Windows para ver el uso de Claude Code y de OpenAI Codex desde la bandeja del sistema, con todas tus cuentas en una sola ventana.
+App de Windows y macOS para ver el uso de Claude Code y de OpenAI Codex desde la bandeja del sistema (la barra de menú en Mac), con todas tus cuentas en una sola ventana.
 
 ## Características
 
 - **Varios servicios a la vez**: Claude Code y OpenAI Codex en la misma lista, cada uno con su cuota y su renovación. Si tenés los dos instalados, la app los detecta sola en el primer arranque.
 - **Perfiles**: agregar, editar (servicio, nombre y ruta), reordenar y eliminar cualquier perfil, incluido el detectado automáticamente.
-- **Tooltip propio**: al pasar el mouse por el icono de la bandeja aparece un resumen con los colores del tema, en lugar del tooltip gris del sistema.
+- **Tooltip propio**: al pasar el mouse por el icono de la bandeja aparece un resumen con los colores del tema, en lugar del tooltip gris del sistema. Funciona igual en Windows y en macOS; si el sistema no puede decir dónde está el icono, la app vuelve sola al tooltip nativo.
 - **Popup de uso**: ventana con el uso de cada perfil por ventana de cuota (últimas 5 horas, últimos 7 días, Fable). Codex reporta las dos primeras; no tiene Fable.
 - **Configuración por usuario**: tema (oscuro/claro), tamaño de letra y colores personalizados por hex.
 - **Alertas**: aviso cuando el uso cruza un umbral, configurable por perfil y por ventana de cuota, con un tiempo mínimo entre avisos.
-- **Persistencia**: toda la configuración se guarda en `%APPDATA%\ClaudeUsage\` (ver [Dónde se guardan los datos](#dónde-se-guardan-los-datos)).
+- **Persistencia**: toda la configuración se guarda en la carpeta de datos del usuario (ver [Dónde se guardan los datos](#dónde-se-guardan-los-datos)).
 
 Para entender cómo está organizado el código, ver [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -24,12 +24,16 @@ Lo bajás, lo ejecutás, y aparece en la bandeja del sistema. Nada más.
 
 > Windows SmartScreen puede avisar que es un ejecutable desconocido, porque el binario no está firmado. *Más información → Ejecutar de todas formas.*
 
+En **macOS** no hay binario publicado: el `.app` se arma en un minuto desde el código fuente (ver [Compilar](#compilar)), y firmarlo para distribuirlo requiere una cuenta de desarrollador de Apple.
+
 ## Requisitos
 
-- Windows.
+- Windows, o macOS 11 o posterior.
 - [Claude Code](https://claude.ai/download) y/o [OpenAI Codex](https://developers.openai.com/codex/) instalados. Alcanza con uno.
 - Tener sesión iniciada en el CLI del perfil que quieras consultar.
-- Python 3 **sólo** si vas a correrlo desde el código fuente o recompilarlo.
+- Python 3.10 o superior **sólo** si vas a correrlo desde el código fuente o recompilarlo.
+  En Mac conviene el instalador oficial de [python.org](https://www.python.org/downloads/macos/):
+  trae su propio Tcl/Tk 8.6, y el Python 3.9 que viene con el sistema no alcanza.
 
 ## Clonar e instalar
 
@@ -37,9 +41,13 @@ Lo bajás, lo ejecutás, y aparece en la bandeja del sistema. Nada más.
 git clone https://github.com/ArroyoLeandro/usageChecker.git
 cd usageChecker
 python -m venv .venv
-.venv\Scripts\activate
+.venv\Scripts\activate      # en macOS: source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+En macOS `pip` trae además `pyobjc`, que es lo que pystray usa para poner el
+icono en la barra de menú. Viene como dependencia de `pystray`, no hay que
+pedirlo aparte.
 
 ## Ejecutar en desarrollo
 
@@ -47,17 +55,24 @@ pip install -r requirements.txt
 python launcher.py
 ```
 
-La app se abre en la bandeja del sistema. Si Claude Code no tiene una sesión iniciada, la app no podrá leer el uso hasta que abras Claude e inicies sesión.
+La app se abre en la bandeja del sistema. Un perfil sin sesión iniciada en su CLI aparece como "hace falta iniciar sesión": abrí Claude Code o Codex, según el perfil, e iniciá sesión ahí.
 
-## Compilar el `.exe`
+## Compilar
 
 ```bash
 python build.py
 ```
 
-El ejecutable se genera en `dist/ClaudeUsage.exe`.
+El mismo script produce lo que corresponda al sistema donde corre: un
+`dist/ClaudeUsage.exe` en Windows y un `dist/ClaudeUsage.app` en macOS.
 
-Ese binario **sí** se versiona, para que siempre haya una copia lista para descargar y ejecutar (ver [Descargar y ejecutar](#descargar-y-ejecutar)). El resto de `dist/` y todo `build/` quedan fuera del repo.
+En Mac, arrastrá `dist/ClaudeUsage.app` a `/Applications` y abrilo desde ahí.
+El bundle se marca como `LSUIElement`, así que no aparece en el Dock ni tiene
+menú propio: vive sólo en la barra de menú. La primera vez macOS puede pedir
+permiso para leer el llavero (ver [De dónde saca la sesión](#de-dónde-saca-la-sesión));
+dale **Permitir siempre** para que no vuelva a preguntar en cada actualización.
+
+El `.exe` **sí** se versiona, para que siempre haya una copia lista para descargar y ejecutar (ver [Descargar y ejecutar](#descargar-y-ejecutar)). El `.app` de macOS no, y el resto de `dist/` y todo `build/` quedan fuera del repo.
 
 Como cada rebuild agrega ~22 MB al historial de git de forma permanente, conviene commitear el `.exe` cuando publicás un cambio que querés que la gente use, no en cada compilación local.
 
@@ -74,8 +89,10 @@ Rutas comunes:
 | Servicio | Ruta |
 |---|---|
 | Claude Code (Windows) | `C:\Users\TU_USUARIO\.claude` |
-| Claude Code (WSL) | `\wsl.localhost\Ubuntu\home\TU_USUARIO\.claude` |
-| OpenAI Codex | `C:\Users\TU_USUARIO\.codex` |
+| Claude Code (macOS) | `/Users/TU_USUARIO/.claude` |
+| Claude Code (WSL) | `\\wsl.localhost\Ubuntu\home\TU_USUARIO\.claude` |
+| OpenAI Codex (Windows) | `C:\Users\TU_USUARIO\.codex` |
+| OpenAI Codex (macOS) | `/Users/TU_USUARIO/.codex` |
 
 La app usa la sesión local de cada carpeta. No copies credenciales al repositorio ni compartas `.credentials.json` (Claude) ni `auth.json` (Codex).
 
@@ -100,6 +117,29 @@ Desde la ventana principal, pestaña **Configuración**:
 - **Tema y tamaño de letra**: se aplican al instante a todas las ventanas.
 - **Colores**: tocá el cuadrito de cada color para elegirlo, o escribí el hex. Los que dicen "del tema" usan el color del tema elegido; en cuanto tocás uno pasa a ser propio. El botón `↺` vuelve al valor anterior.
 - **Alertas**: activá los avisos y definí los umbrales (por ejemplo `80, 95`). Hay un umbral **General** que se usa en los perfiles sin umbral propio, y podés definir umbrales distintos por perfil y por ventana de cuota. El **tiempo mínimo entre avisos** evita que el mismo aviso se repita: como una ventana de cuota se reinicia cada varias horas, para no volver a recibir el mismo aviso conviene un valor mayor a ese período.
+
+## De dónde saca la sesión
+
+Cada servicio guarda su token donde quiere, y el adapter de cada uno sabe
+dónde buscarlo. Codex es el caso simple: `auth.json` dentro de la carpeta del
+perfil, en cualquier sistema operativo. Claude Code depende del sistema.
+
+En Windows y Linux, Claude Code deja el token en `.credentials.json` dentro de
+la carpeta del perfil, y la app lo lee de ahí.
+
+En **macOS no existe ese archivo**: Claude Code guarda el mismo JSON en el
+llavero (Keychain), bajo el servicio `Claude Code-credentials`. La app lo lee
+con `/usr/bin/security`, que es el binario firmado por Apple al que el llavero
+ya le da acceso — por eso el permiso se pide una sola vez y no en cada consulta.
+
+Ese detalle tiene una consecuencia: la entrada del llavero es **una sola** y no
+distingue carpetas de configuración, así que sólo puede responder por el perfil
+que apunta a tu `~/.claude`. Un segundo perfil de Claude en Mac que apunte a
+otra carpeta va a mostrar "sin sesión" salvo que esa carpeta tenga su propio
+`.credentials.json` (por ejemplo, una `.claude` de WSL montada). Es a propósito:
+la alternativa sería mostrar el uso de tu cuenta principal con el nombre de otro
+perfil. Los perfiles de Codex no tienen este límite, porque su token siempre
+está en un archivo dentro de la carpeta que vos elegiste.
 
 ## Servidor MCP: que un agente consulte el uso
 
@@ -274,12 +314,34 @@ gate que falla cerrado te deja afuera de la sesión que necesitarías para
 desbloquearlo, hasta que resetee la cuota horas después. Gastar de más se
 recupera; no poder escribir, no.
 
+
 ## Dónde se guardan los datos
 
-Todo vive en `%APPDATA%\ClaudeUsage\` (normalmente `C:\Users\TU_USUARIO\AppData\Roaming\ClaudeUsage\`):
+En Windows, todo vive en `%APPDATA%\ClaudeUsage\` (normalmente
+`C:\Users\TU_USUARIO\AppData\Roaming\ClaudeUsage\`). En macOS, en
+`~/Library/Application Support/ClaudeUsage/`. En ambos casos:
 
 - `config.json` — perfiles (con su servicio) y preferencias (tema, colores, alertas). Es por computadora: cualquier ejecución de la app lee y escribe este mismo archivo.
 - `alert-state.json` — estado interno de las alertas (qué se notificó y cuándo). Se puede borrar sin perder configuración.
 - `budgets/<session-id>.json` — el techo de cada sesión que fijó uno. Borrar el archivo equivale a `/usage-budget off` en esa sesión. Los que quedan de sesiones muertas se barren solos a los 7 días.
 - `usage-cache-<cuenta>.json` — la última cifra de uso que leyó el hook, una por cuenta. Machine-written y descartable: sin esto, el hook haría una llamada a la API antes de cada prompt y de cada tool.
-- `claude-usage.log` — registro de diagnóstico. Si algo falla, el error queda acá (el `.exe` se compila sin consola, así que este archivo es la forma de ver qué pasó).
+- `claude-usage.log` — registro de diagnóstico. Si algo falla, el error queda acá (la app se compila sin consola, así que este archivo es la forma de ver qué pasó).
+
+## Diferencias entre plataformas
+
+| | Windows | macOS |
+|---|---|---|
+| Dónde vive el icono | bandeja del sistema | barra de menú |
+| Token de sesión | `.credentials.json` | llavero (Keychain) |
+| Tooltip al pasar el mouse | propio, con los colores del tema | propio, con los colores del tema |
+| Arranque automático | registro de Windows | LaunchAgent en `~/Library/LaunchAgents` |
+| Dónde se abre el popup | abajo a la derecha, sobre la barra de tareas | arriba a la derecha, bajo la barra de menú |
+
+El tooltip propio necesita saber dónde está el icono en pantalla. Windows lo
+contesta con `Shell_NotifyIconGetRect`; macOS no tiene esa función, pero cada
+item de la barra de menú vive en su propia ventana y una ventana sí sabe su
+frame, así que la respuesta existe por otro camino. En las dos plataformas la
+app pregunta en cada polleo -- el icono se corre cuando aparece o desaparece
+otro al lado -- y si en algún momento deja de haber respuesta, vuelve sola al
+tooltip nativo, que muestra la misma información.
+
