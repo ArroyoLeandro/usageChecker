@@ -128,18 +128,24 @@ En Windows y Linux, Claude Code deja el token en `.credentials.json` dentro de
 la carpeta del perfil, y la app lo lee de ahí.
 
 En **macOS no existe ese archivo**: Claude Code guarda el mismo JSON en el
-llavero (Keychain), bajo el servicio `Claude Code-credentials`. La app lo lee
-con `/usr/bin/security`, que es el binario firmado por Apple al que el llavero
-ya le da acceso — por eso el permiso se pide una sola vez y no en cada consulta.
+llavero (Keychain). La app lo lee con `/usr/bin/security`, que es el binario
+firmado por Apple al que el llavero ya le da acceso — por eso el permiso se pide
+una sola vez y no en cada consulta.
 
-Ese detalle tiene una consecuencia: la entrada del llavero es **una sola** y no
-distingue carpetas de configuración, así que sólo puede responder por el perfil
-que apunta a tu `~/.claude`. Un segundo perfil de Claude en Mac que apunte a
-otra carpeta va a mostrar "sin sesión" salvo que esa carpeta tenga su propio
-`.credentials.json` (por ejemplo, una `.claude` de WSL montada). Es a propósito:
-la alternativa sería mostrar el uso de tu cuenta principal con el nombre de otro
-perfil. Los perfiles de Codex no tienen este límite, porque su token siempre
-está en un archivo dentro de la carpeta que vos elegiste.
+El nombre del servicio no es uno solo: Claude Code lo deriva de la carpeta de
+configuración, pegándole al nombre base `Claude Code-credentials` un guión y los
+primeros ocho caracteres del SHA-256 de la ruta. La única excepción es su propio
+`~/.claude`, cuya entrada queda sin sufijo. Por eso la app arma los dos nombres
+posibles y prueba primero el que lleva el sufijo: eso deja que **cada perfil
+lea su propia sesión** — un segundo perfil apuntando a `~/.claude-trabajo`
+encuentra la suya — sin que el nombre pelado se le ofrezca nunca a otra carpeta,
+que es la consulta que haría aparecer el uso de tu cuenta principal con el
+nombre de otro perfil.
+
+Una carpeta desde la que nunca iniciaste sesión simplemente no tiene entrada y
+se muestra como "sin sesión", salvo que tenga su propio `.credentials.json` (por
+ejemplo, una `.claude` de WSL montada). Los perfiles de Codex no pasan por nada
+de esto: su token siempre está en un archivo dentro de la carpeta que elegiste.
 
 ## Servidor MCP: que un agente consulte el uso
 

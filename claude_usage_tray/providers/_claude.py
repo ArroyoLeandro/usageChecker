@@ -8,16 +8,17 @@ rest of the app reads). None of that behavior changed -- it just stopped
 being the only possibility.
 
 The macOS Keychain fallback in `_oauth_blob` moved here for the same reason:
-it is Claude Code's Keychain entry, under Claude Code's fixed service name,
-and no other provider has one. Reading it from `api.py` would have made a
-provider-agnostic module carry one provider's storage quirk -- and, worse,
-would only have fixed `read_access_token`, leaving `usage_request` (which
-reads the credentials again to build the Authorization header) still looking
-for a file macOS never wrote.
+it is Claude Code's Keychain entry, under a service name Claude Code derives
+from the config directory, and no other provider has one. Reading it from
+`api.py` would have made a provider-agnostic module carry one provider's
+storage quirk -- and, worse, would only have fixed `read_access_token`,
+leaving `usage_request` (which reads the credentials again to build the
+Authorization header) still looking for a file macOS never wrote.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -31,10 +32,18 @@ from ._types import UsageRequest, quota_entry
 API_URL_USAGE = "https://api.anthropic.com/api/oauth/usage"
 FALLBACK_USER_AGENT = "claude-code/2.1.201"
 CREDENTIALS_FILENAME = ".credentials.json"
-#: The Keychain service name Claude Code stores its credentials JSON under on
-#: macOS. Fixed by Claude Code, not by us -- it takes no config-dir suffix,
-#: which is why only the ambient default directory can read it.
+#: Base of the Keychain service name Claude Code stores its credentials JSON
+#: under on macOS. Every directory other than the home default appends
+#: `-<digest>` to it; see `_keychain_services`.
 KEYCHAIN_SERVICE = "Claude Code-credentials"
+#: How many hex characters of the config directory's SHA-256 Claude Code puts
+#: in the qualified service name.
+KEYCHAIN_DIGEST_CHARS = 8
+#: The config directory Claude Code treats as its default, and the only one
+#: whose Keychain entry carries no digest suffix. Deliberately *not*
+#: `_default_config_dir()`: that one follows `CLAUDE_CONFIG_DIR`, and the
+#: unsuffixed entry belongs to `~/.claude` whatever the environment says.
+HOME_DEFAULT_DIRNAME = ".claude"
 
 
 def _cli_path() -> Path | None:
@@ -94,17 +103,80 @@ def _is_ambient(config_dir: Path) -> bool:
     """Whether `config_dir` is the directory the local Claude Code administers.
 
     The same question `config.ClaudeProfile.is_ambient_default` answers, asked
-    of a bare path because an adapter never sees a profile. Two callers below
-    need it -- the Keychain fallback and `refresh_credentials` -- for the same
-    underlying reason: both reach for state belonging to whichever account the
-    local CLI is logged into, and neither can tell one config directory's
-    account from another's.
+    of a bare path because an adapter never sees a profile. `refresh_credentials`
+    is the one caller: `claude update` renews the session of whichever account
+    the local CLI is logged into, and it takes no config directory, so it can
+    only be run for the directory that *is* the local CLI's.
+
+    Reading credentials no longer asks this. The Keychain names its entries per
+    config directory (`_keychain_services`), so any profile can be told apart
+    from any other -- which is what the fallback needed and this question could
+    not give it.
     """
     default = _default_config_dir()
     try:
         return config_dir.expanduser().resolve() == default.expanduser().resolve()
     except OSError:
         return str(config_dir).lower() == str(default).lower()
+
+
+def _is_home_default(config_dir: Path) -> bool:
+    """Whether `config_dir` is the `~/.claude` Claude Code falls back to.
+
+    Distinct from `_is_ambient`, which follows `CLAUDE_CONFIG_DIR`. The
+    unsuffixed Keychain entry is written for `~/.claude` and stays that
+    account's whatever the environment of *this* process happens to say, so
+    reusing `_is_ambient` here would hand the home account's token to whichever
+    directory the launching shell pointed at -- and, worse, would stop
+    answering for `~/.claude` itself.
+    """
+    home_default = Path.home() / HOME_DEFAULT_DIRNAME
+    try:
+        return config_dir.expanduser().resolve() == home_default.resolve()
+    except OSError:
+        return str(config_dir).lower() == str(home_default).lower()
+
+
+def _keychain_services(config_dir: Path) -> list[str]:
+    """Keychain service names that could hold `config_dir`'s credentials, in
+    the order they should be tried.
+
+    Claude Code derives the name from the config directory: the first
+    `KEYCHAIN_DIGEST_CHARS` hex characters of the SHA-256 of the directory
+    path, appended to `KEYCHAIN_SERVICE`. The one exception is its own default
+    `~/.claude`, whose entry carries no suffix at all -- so a rule that
+    suffixed everything would break the only account that works today.
+
+    Hence two candidates for the home default and exactly one for anybody else.
+    The qualified name goes first even for the home default: it names a single
+    directory, so preferring it can only ever be more precise, and it keeps
+    working if Claude Code ever starts suffixing that entry too. The unsuffixed
+    name is never offered to another directory, because that is the lookup that
+    would report the home account's usage under a second profile's name.
+
+    Both the given spelling and the resolved one are hashed, since a profile
+    may store `~/.claude-work` or a path through a symlinked home while Claude
+    Code hashed the real one.
+    """
+    spellings: list[str] = []
+    expanded = config_dir.expanduser()
+    spellings.append(str(expanded))
+    try:
+        resolved = str(expanded.resolve())
+    except OSError:
+        resolved = None
+    if resolved is not None and resolved not in spellings:
+        spellings.append(resolved)
+
+    services: list[str] = []
+    for spelling in spellings:
+        digest = hashlib.sha256(spelling.encode("utf-8")).hexdigest()[:KEYCHAIN_DIGEST_CHARS]
+        service = f"{KEYCHAIN_SERVICE}-{digest}"
+        if service not in services:
+            services.append(service)
+    if _is_home_default(config_dir):
+        services.append(KEYCHAIN_SERVICE)
+    return services
 
 
 def _read_credentials_blob(config_dir: Path) -> str | None:
@@ -114,13 +186,13 @@ def _read_credentials_blob(config_dir: Path) -> str | None:
     points a profile at a copied `.claude` gets that profile's token, and a
     WSL directory mounted on a Mac keeps working.
 
-    The Keychain is the fallback, and only for the ambient default directory.
-    Claude Code on macOS writes no `.credentials.json` at all -- the blob
-    lives in the login Keychain under a single, fixed service name, with no
-    room for a config-dir qualifier. So it can only answer for the one
-    directory that *is* the ambient default; letting any other profile fall
-    back to it would make every macOS profile silently report the default
-    account's usage, which is worse than reporting no session at all.
+    The Keychain is the fallback. Claude Code on macOS writes no
+    `.credentials.json` at all -- the blob lives in the login Keychain, under a
+    service name derived from the config directory (`_keychain_services`).
+    Because the name identifies the directory, every profile can be answered
+    from the store without any risk of handing one account's token to another;
+    a directory nobody ever logged in from simply has no entry and reads as no
+    session.
 
     An `OSError` on a file that *exists* is a real fault, not "nothing here,
     try the store": falling through would answer one profile with another
@@ -132,8 +204,10 @@ def _read_credentials_blob(config_dir: Path) -> str | None:
             return path.read_text(encoding="utf-8")
     except OSError:
         return None
-    if _is_ambient(config_dir):
-        return platform.read_secret(KEYCHAIN_SERVICE)
+    for service in _keychain_services(config_dir):
+        blob = platform.read_secret(service)
+        if blob:
+            return blob
     return None
 
 

@@ -186,8 +186,9 @@ por proveedor.
 ### Por qué el llavero de macOS vive acá adentro
 
 Claude Code en macOS no escribe `.credentials.json`: guarda el mismo JSON en
-el llavero, bajo un nombre de servicio fijo. Esa lectura es del adapter de
-Claude y no de `api.py`, por dos razones que se refuerzan.
+el llavero, bajo un nombre de servicio que deriva de la carpeta de
+configuración. Esa lectura es del adapter de Claude y no de `api.py`, por dos
+razones que se refuerzan.
 
 La primera es de pertenencia: la entrada del llavero es de Claude Code, con el
 nombre de Claude Code, y ningún otro proveedor tiene una. Ponerla en la capa
@@ -199,16 +200,28 @@ La segunda es que arriba el arreglo quedaba a medias. Las credenciales se leen
 `Authorization` del pedido de uso. Un fallback que sólo cubriera la primera
 dejaba la bandeja diciendo "sesión iniciada" y sin números para siempre.
 
-De ahí sale la regla que el adapter codifica en `_is_ambient`: la entrada del
-llavero es **una sola** y no distingue carpetas, así que sólo puede contestar
-por el perfil que apunta al `~/.claude` de la máquina. Cualquier otro perfil en
-Mac muestra "sin sesión" salvo que su carpeta tenga su propio
-`.credentials.json` (una `.claude` de WSL montada, por ejemplo). La alternativa
-—que todos los perfiles del Mac reporten la cuenta principal con nombres
-distintos— es dato equivocado presentado con confianza, que es peor que la
-ausencia de dato. El archivo, cuando existe, siempre gana; y un archivo que
-existe pero no se puede leer es una falla real, no una invitación a preguntarle
-al llavero.
+Qué entrada del llavero contesta por qué carpeta lo resuelve
+`_keychain_services`. El nombre no es global: Claude Code le pega al base
+`Claude Code-credentials` un guión y los primeros ocho caracteres del SHA-256
+de la ruta de la carpeta, con su propio `~/.claude` como única excepción, que
+queda sin sufijo. Las dos mitades importan por igual: sin el sufijo, todo
+perfil que no sea el de casa muestra "sin sesión"; con el sufijo aplicado a
+todos, el que se rompe es justamente el de casa.
+
+Por eso el adapter arma la lista de candidatos y prueba primero el nombre
+sufijado —nombra una sola carpeta, así que preferirlo sólo puede ser más
+preciso, y sigue andando si Claude Code algún día sufija también la entrada por
+defecto—. El nombre pelado no se le ofrece nunca a otra carpeta: ésa es la
+consulta que haría que todos los perfiles del Mac reporten la cuenta principal
+con nombres distintos, dato equivocado presentado con confianza, que es peor
+que la ausencia de dato. Una carpeta desde la que nadie inició sesión no tiene
+entrada y se lee como "sin sesión".
+
+`_is_ambient` sigue existiendo, pero ya no para esto: su único cliente es
+`refresh_credentials`, porque `claude update` renueva la sesión de la cuenta en
+la que está logueado el CLI local y no recibe carpeta alguna. El archivo,
+cuando existe, siempre gana; y un archivo que existe pero no se puede leer es
+una falla real, no una invitación a preguntarle al llavero.
 
 ### Por qué Codex no agregó ventanas de cuota nuevas
 
