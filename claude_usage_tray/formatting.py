@@ -2,10 +2,8 @@
 
 Every function here is free of I/O, UI, and network: no tkinter, no PIL, no
 pystray, no `requests`. Move-only extraction from `app.py`; no output
-changed for any existing call site (see
-`openspec/changes/foundations-refactor/design.md` for the
-characterize-then-move sequence this followed and
-`tests/test_formatting.py` for the characterization evidence).
+changed for any existing call site: the move was characterized first and
+`tests/test_formatting.py` holds that characterization evidence.
 
 Time-dependent functions (`reset_text`, `reset_label`, `updated_text`,
 `parse_meta_datetime`) accept keyword-only `now`/`tz`, following the
