@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 from .. import formatting, platform
 from ..config import ClaudeProfile
+from ..platform import Rect
 from ..theme import DEFAULT_THEME, Theme
 from .dismiss import DismissManager
 from .widgets import apply_window_icon, button, create_progress_row
@@ -141,6 +142,7 @@ def show_popup(
     existing: tk.Toplevel | None = None,
     window_icon: Any | None = None,
     dismiss_manager: DismissManager | None = None,
+    tray_rect: Rect | None = None,
     on_refresh: Callable[[], None] | None = None,
     on_manage_profiles: Callable[[], None] | None = None,
 ) -> tk.Toplevel:
@@ -152,7 +154,9 @@ def show_popup(
     self._popup.winfo_exists(): self._popup.destroy()` guard at the top of
     `_show_popup`). If `dismiss_manager` is given, the popup registers for
     click-outside dismissal there instead of the caller managing a global
-    binding itself. `on_refresh`/`on_manage_profiles` are called
+    binding itself. `tray_rect` is the tray icon's screen rectangle, used only to pick which
+    display to place the popup on; `None` means the caller could not read it
+    and the primary display is used. `on_refresh`/`on_manage_profiles` are called
     synchronously on the UI thread -- if the caller wants refresh to run in
     a background thread (the original did), that is the caller's callback to
     write, not this module's concern.
@@ -240,7 +244,16 @@ def show_popup(
 
     popup.update_idletasks()
     w, h = popup.winfo_width(), popup.winfo_height()
-    work_area = platform.work_area_bounds()
+    # Clamp to the display the tray icon is actually on, not the primary
+    # one. With a second monitor attached those are different screens, and
+    # anchoring to the primary drops the popup on a display the user is not
+    # looking at, far from the icon that opened it. `None` means the caller
+    # could not read the icon's rectangle, which is not a failure -- the
+    # primary display is then the only answer available.
+    work_area = (
+        platform.work_area_bounds() if tray_rect is None
+        else platform.work_area_for_rect(tray_rect)
+    )
     if work_area is None:
         work_top = 0
         work_right = popup.winfo_screenwidth()

@@ -9,7 +9,7 @@ import tkinter as tk
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from tkinter import messagebox
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from PIL import ImageTk
 
@@ -140,6 +140,10 @@ class UsageTrayApp:
         self._color_baseline: Mapping[str, str] = {}
         self._hover_popup: tk.Toplevel | None = None
         self._hover_tracker: ui.HoverTracker | None = None
+        # Set once hover tracking resolves a tray handle; stays `None` on a
+        # platform that never resolves one, which is why every reader treats
+        # it as optional rather than assuming the tray is introspectable.
+        self._tray_rect_of: Callable[[], platform.Rect | None] | None = None
         # Start on the native tooltip and earn the custom one: the tray
         # handle, the icon id and a readable rect are all discovered at
         # runtime, and anything we cannot confirm must leave the user with
@@ -571,10 +575,17 @@ class UsageTrayApp:
 
         self._native_tooltip = False
         self._apply_to_tray(title="")
+        # Held on the instance, not just closed over by the tracker: the
+        # usage popup needs the same rectangle to know which display to open
+        # on, and it is opened by a click, nowhere near the hover path.
+        def rect_of() -> platform.Rect | None:
+            return platform.tray_icon_rect(handle)
+
+        self._tray_rect_of = rect_of
         self._hover_tracker = ui.HoverTracker(
             # Re-read on every tick, never cached: the icon moves whenever a
             # neighbour appears or disappears in the menu bar / tray.
-            rect_of=lambda: platform.tray_icon_rect(handle),
+            rect_of=rect_of,
             cursor_of=platform.cursor_position,
             # Every callback hops to the Tk main thread through the queue that
             # already exists: on Windows these fire on the tracker's polling
@@ -683,7 +694,7 @@ class UsageTrayApp:
                 rect,
                 theme=self._theme,
                 existing=self._hover_popup,
-                work_area=platform.work_area_bounds(),
+                work_area=platform.work_area_for_rect(rect),
             )
         except Exception:
             # A popup that cannot be built must not leave the user hovering
@@ -699,6 +710,24 @@ class UsageTrayApp:
         except Exception:
             log.exception("could not hide the hover popup")
 
+    def _tray_icon_rect(self) -> platform.Rect | None:
+        """The tray icon's current rectangle, or `None` if it cannot be read.
+
+        Only ever used to choose which display a window opens on, so every
+        failure answers `None` and the caller falls back to the primary
+        display. Reading it touches live AppKit state on macOS and therefore
+        must happen on the UI thread -- which is where `_show_popup` already
+        runs, since it is dispatched through `_run_on_ui`.
+        """
+        rect_of = self._tray_rect_of
+        if rect_of is None:
+            return None
+        try:
+            return rect_of()
+        except Exception:
+            log.debug("could not read the tray icon rect", exc_info=True)
+            return None
+
     def _show_popup(self, data: dict[str, Any]) -> None:
         log.info("opening usage popup")
         self._popup = ui.show_popup(
@@ -709,6 +738,7 @@ class UsageTrayApp:
             existing=self._popup,
             window_icon=self._window_icon,
             dismiss_manager=self._dismiss_manager,
+            tray_rect=self._tray_icon_rect(),
             on_refresh=lambda: threading.Thread(target=self._refresh_popup, daemon=True).start(),
             on_manage_profiles=lambda: self._show_main_window(ui.TAB_PROFILES),
         )

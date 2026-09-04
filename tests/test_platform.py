@@ -537,3 +537,91 @@ def test_hidpi_replacement_falls_back_to_pystray_instead_of_raising():
     assert platform.bind_tray_hidpi_image(icon) is True
     icon._assert_image()
     assert icon.fallback_calls == 1
+
+
+# --- work_area_for_rect: which monitor, and which height to flip against ----
+#
+# Runs on every OS. `_darwin.py` imports AppKit inside its functions, never at
+# module scope, so a fake module in `sys.modules` is enough to drive it -- and
+# a fake is the only way to get a second monitor of a different height into a
+# test at all.
+
+
+class _FakeScreen:
+    def __init__(self, frame, visible):
+        self._frame, self._visible = frame, visible
+
+    def frame(self):
+        return self._frame
+
+    def visibleFrame(self):
+        return self._visible
+
+
+def _cg_rect(x, y, width, height):
+    origin = type("Point", (), {"x": x, "y": y})()
+    size = type("Size", (), {"width": width, "height": height})()
+    return type("Rect", (), {"origin": origin, "size": size})()
+
+
+#: Primary: 1728x1117, 33pt of menu bar. Cocoa's global origin is its bottom
+#: left, so its frame sits at (0, 0).
+_PRIMARY = _FakeScreen(_cg_rect(0, 0, 1728, 1117), _cg_rect(0, 0, 1728, 1084))
+#: Secondary: deliberately TALLER (1440) and vertically offset, because a
+#: second monitor the same height as the first cannot catch a wrong flip.
+_SECONDARY = _FakeScreen(_cg_rect(1728, -100, 2560, 1440), _cg_rect(1728, -100, 2560, 1415))
+
+
+@pytest.fixture
+def two_monitors(monkeypatch):
+    import types
+
+    fake = types.ModuleType("AppKit")
+    fake.NSScreen = type(
+        "NSScreen",
+        (),
+        {
+            "screens": staticmethod(lambda: [_PRIMARY, _SECONDARY]),
+            "mainScreen": staticmethod(lambda: _PRIMARY),
+        },
+    )
+    monkeypatch.setitem(sys.modules, "AppKit", fake)
+    from claude_usage_tray.platform import _darwin
+
+    return _darwin
+
+
+def test_work_area_follows_the_monitor_the_tray_icon_is_on(two_monitors):
+    # A menu-bar icon on the secondary display must clamp windows to the
+    # secondary display's work area, not the primary's. Getting this wrong is
+    # what made every popup open on the main screen.
+    icon = platform.Rect(left=2000, top=-223, right=2038, bottom=-190)
+    area = two_monitors.work_area_for_rect(icon)
+    assert (area.left, area.right) == (1728, 4288)
+
+
+def test_the_cocoa_flip_uses_the_primary_height_not_the_containing_screen(two_monitors):
+    # The subtle one. Cocoa has a single global space anchored to the PRIMARY
+    # display's bottom-left, so every y flips against 1117 -- the primary's
+    # height -- whichever monitor the point is on. Flipping the secondary's
+    # coordinates against its own 1440 instead would answer top=125 here,
+    # 323px out, and would only ever be visible to someone with two monitors
+    # of different heights.
+    icon = platform.Rect(left=2000, top=-223, right=2038, bottom=-190)
+    area = two_monitors.work_area_for_rect(icon)
+    assert area.top == int(1117 - (-100 + 1415)) == -198
+    assert area.bottom == int(1117 - (-100)) == 1217
+
+
+def test_an_icon_on_the_primary_still_gets_the_primary_work_area(two_monitors):
+    icon = platform.Rect(left=1303, top=0, right=1341, bottom=33)
+    area = two_monitors.work_area_for_rect(icon)
+    assert (area.left, area.top, area.right, area.bottom) == (0, 33, 1728, 1117)
+
+
+def test_a_rect_on_no_monitor_falls_back_instead_of_answering_nothing(two_monitors):
+    # A display unplugged between reading the rect and asking this. The
+    # primary's work area is the wrong monitor but an on-screen one, which
+    # beats placing the window nowhere.
+    nowhere = platform.Rect(left=-9000, top=-9000, right=-8990, bottom=-8990)
+    assert two_monitors.work_area_for_rect(nowhere) is not None

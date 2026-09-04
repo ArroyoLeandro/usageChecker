@@ -55,9 +55,10 @@ def work_area_bounds() -> WorkArea | None:
     if screen is None:
         return None
 
-    full = screen.frame()
     visible = screen.visibleFrame()
-    screen_height = full.size.height
+    screen_height = _cocoa_global_height()
+    if screen_height is None:
+        return None
 
     left = int(visible.origin.x)
     right = int(visible.origin.x + visible.size.width)
@@ -66,6 +67,80 @@ def work_area_bounds() -> WorkArea | None:
     top = int(screen_height - (visible.origin.y + visible.size.height))
     bottom = int(screen_height - visible.origin.y)
     return WorkArea(left=left, top=top, right=right, bottom=bottom)
+
+
+def _cocoa_global_height() -> float | None:
+    """The height every Cocoa y in this process must be flipped against.
+
+    Cocoa has a single global coordinate space whose origin is the bottom
+    left of the *primary* display -- `NSScreen.screens()[0]`, the one with
+    the menu bar -- and every screen's frame is expressed inside it. Tk's
+    origin is the top left of that same primary display with y growing down,
+    so converting between them is `y_tk = primary_height - y_cocoa` no
+    matter which monitor the point is on.
+
+    Deliberately not `NSScreen.mainScreen()`, which is the screen holding the
+    key window and therefore moves as the user does. Flipping a secondary
+    monitor's coordinates against its own height silently misplaces windows
+    by the difference between the two monitors' heights, which is exactly
+    zero while you are testing on one screen.
+    """
+    try:
+        from AppKit import NSScreen
+    except Exception:
+        return None
+
+    screens = NSScreen.screens()
+    if not screens:
+        return None
+    return screens[0].frame().size.height
+
+
+def work_area_for_rect(rect: Rect) -> WorkArea | None:
+    """`visibleFrame` of the NSScreen containing `rect`, in Tk coordinates.
+
+    `rect` arrives in Tk's space (top-left origin, y down) because that is
+    what `tray_icon_rect()` promises, so it is flipped back into Cocoa's
+    space to be tested against the screen frames, and the answer is flipped
+    forward again. Both flips go against the primary display's height -- see
+    `_cocoa_global_height()`; using the containing screen's own height here
+    is the subtle way to get this wrong on monitors of different sizes.
+
+    The rect's centre is the test point, not a corner: a menu-bar icon sits
+    flush against the top edge of its screen, and a corner lands on the
+    boundary where a half-open containment test can fall through to the
+    neighbouring display.
+    """
+    try:
+        from AppKit import NSScreen
+    except Exception:
+        return None
+
+    flip = _cocoa_global_height()
+    if flip is None:
+        return None
+
+    centre_x = rect.left + rect.width / 2
+    centre_y = flip - (rect.top + rect.height / 2)
+
+    for screen in NSScreen.screens():
+        frame = screen.frame()
+        if not (frame.origin.x <= centre_x < frame.origin.x + frame.size.width):
+            continue
+        if not (frame.origin.y <= centre_y < frame.origin.y + frame.size.height):
+            continue
+        visible = screen.visibleFrame()
+        return WorkArea(
+            left=int(visible.origin.x),
+            top=int(flip - (visible.origin.y + visible.size.height)),
+            right=int(visible.origin.x + visible.size.width),
+            bottom=int(flip - visible.origin.y),
+        )
+
+    # No screen owns the point -- a monitor unplugged since the rect was
+    # read, most likely. The primary display's work area is wrong but on
+    # screen, which beats placing the window nowhere.
+    return work_area_bounds()
 
 
 def open_in_file_manager(path: Path) -> None:
@@ -260,17 +335,47 @@ def _is_on_a_screen(origin_x: float, origin_y: float, width: float, height: floa
     return False
 
 
-def tooltip_window_style() -> tuple[str, tuple[str, ...]] | None:
-    # Aqua's own window class for a tooltip. Mapping an ordinary window
-    # activates the app, and activating an app pulls the user to the Space
-    # its windows are on -- so a plain borderless Toplevel used as a hover
-    # tooltip drags the user off their current Space and monitor. A
-    # `help`-class window is not an activating surface.
-    #
-    # No attributes: see the facade's docstring. Passing an attribute list --
-    # `noActivates` included -- re-applies the window's attributes after
-    # creation, and that re-application is what activates the app.
-    return ("help", ())
+def present_window_without_activating(window_title: str) -> bool:
+    """`orderFrontRegardless` the NSWindow carrying `window_title`.
+
+    AppKit is imported inside the function for the reason `work_area_bounds`
+    spells out: this seam is pulled in by headless code paths and must not
+    drag a GUI framework into every import of the package.
+
+    Measured on Tk 8.6.18 / macOS 26.6, from a fresh process each time,
+    reading the compositor's own on-screen window list from a *separate*
+    process (`CGWindowListCopyWindowInfo`, which needs no Screen Recording
+    permission for bounds and owner pid) and NSWorkspace's frontmost
+    application before and after:
+
+      toolkit's own show path   visible, but activated the app 10 of 10
+      orderFrontRegardless      visible and activated 0 of 5
+
+    `isVisible` is NOT a usable check here and was what misled an earlier
+    attempt: it answers `True` for a window the window server is not
+    compositing at all. Only the on-screen list, read from outside, tells
+    the truth.
+    """
+    try:
+        from AppKit import NSApp
+    except Exception:
+        return False
+
+    app = NSApp()
+    if app is None:
+        return False
+
+    for window in app.windows():
+        if window.title() != window_title:
+            continue
+        # Floating/panel-level windows default to hidesOnDeactivate, which
+        # would hide this one for exactly as long as the app stays inactive
+        # -- that is, always, which is the whole point. Clearing it costs
+        # nothing on a window that never had it set.
+        window.setHidesOnDeactivate_(False)
+        window.orderFrontRegardless()
+        return True
+    return False
 
 
 def tray_icon_rect(handle: TrayHandle) -> Rect | None:

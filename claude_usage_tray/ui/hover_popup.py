@@ -31,7 +31,7 @@ import tkinter as tk
 from typing import Any
 
 from .. import formatting
-from ..platform import Rect, WorkArea, tooltip_window_style
+from ..platform import Rect, WorkArea, present_window_without_activating
 from ..theme import DEFAULT_THEME, Theme
 
 log = logging.getLogger(__name__)
@@ -51,6 +51,12 @@ QUOTA_LABELS: dict[str, str] = {
 # attached to it.
 _ICON_GAP = 8
 _EDGE_MARGIN = 4
+
+#: Identifies this window to `present_window_without_activating()`, which has
+#: no other way to pick one window out of the application's. Never seen: the
+#: popup is borderless, so no title is drawn anywhere. Unique on purpose --
+#: `popup.py` titles its own window differently.
+_WINDOW_TITLE = "claude-usage-tray-hover-popup"
 
 
 def _quota_row(parent: tk.Widget, label: str, value: float, theme: Theme) -> None:
@@ -123,54 +129,37 @@ def _section(parent: tk.Widget, section: formatting.HoverSection, theme: Theme, 
         _quota_row(block, QUOTA_LABELS.get(key, key), value, theme)
 
 
-def _declare_as_tooltip(popup: tk.Toplevel) -> None:
-    """Make `popup` a window the OS understands as a tooltip, if it has such
-    a notion, falling back to a plain borderless window if it does not.
+def _show_without_activating(popup: tk.Toplevel) -> None:
+    """Put `popup` on screen without pulling the application to the front.
 
-    Two different ways of saying "no chrome", and the platform picks:
+    `deiconify()` is the ordinary way and it is wrong here on exactly one
+    platform. On Aqua it activates the application, and macOS answers an
+    activation by switching the user to the Space where that application's
+    windows live -- so hovering a menu-bar icon threw the user onto another
+    Space and monitor, reported as "me mueve a la pantalla principal". The
+    seam routes around it where that is a real problem and declines
+    everywhere else, which is why this is a fallback and not a branch.
 
-    - `overrideredirect(True)` everywhere the seam answers `None`. It strips
-      the decorations and nothing else, which is all Windows and Linux need.
-    - A declared window class where the seam names one. On macOS that matters
-      for a reason that has nothing to do with decoration: mapping an
-      ordinary window *activates the application*, and macOS answers an
-      activation by switching the user to the Space where that application's
-      windows live. Hovering a menu-bar icon would therefore throw the user
-      onto another Space -- reported as "me mueve a la pantalla principal".
-      Declaring the window `help` maps it without activating anyone.
+    The two paths are alternatives, never both: the seam's path works
+    precisely by not going through the activating one, so calling
+    `deiconify()` as well would hand the activation straight back.
 
-    Order matters and is not interchangeable: the class must be declared
-    before the window is mapped, and `overrideredirect` is *not* also applied
-    on top of it -- doing both re-applies the window's attributes and brings
-    the activation straight back.
-
-    Defensive by design. `MacWindowStyle` lives under `::tk::unsupported::`,
-    which is Tcl's way of promising nothing, so a Tk build that does not know
-    the class raises `TclError`. That must not cost the user their tooltip:
-    the fallback is the borderless window every other platform uses, which is
-    exactly the behaviour that shipped before this window class existed.
+    Defensive on purpose. Reaching a native window is the fragile kind of
+    thing that a toolkit upgrade can quietly move, and this popup is not
+    worth an exception on the UI thread: any failure falls back to the plain
+    `deiconify()`, which is what shipped before and is merely the old
+    behaviour, not a broken one.
     """
-    style = tooltip_window_style()
-    if style is None:
-        popup.overrideredirect(True)
-        return
-
-    window_class, attributes = style
     try:
-        args = ["style", popup._w, window_class]
-        if attributes:
-            # Tk's signature is `style window ?class attributes?`: the
-            # attributes are ONE argument holding a Tcl list, not varargs.
-            args.append(" ".join(attributes))
-        popup.tk.call("::tk::unsupported::MacWindowStyle", *args)
-    except tk.TclError:
+        if present_window_without_activating(_WINDOW_TITLE):
+            return
+    except Exception:
         log.warning(
-            "this Tk build rejected the %r tooltip window class; "
-            "falling back to a borderless window",
-            window_class,
+            "could not show the hover popup without activating the app; "
+            "falling back to deiconify",
             exc_info=True,
         )
-        popup.overrideredirect(True)
+    popup.deiconify()
 
 
 def _place(popup: tk.Toplevel, rect: Rect, work_area: WorkArea | None) -> None:
@@ -232,7 +221,8 @@ def show_hover_popup(
     palette = theme.palette
     popup = tk.Toplevel(root)
     popup.withdraw()  # place it before it is ever seen, so it cannot flash
-    _declare_as_tooltip(popup)
+    popup.title(_WINDOW_TITLE)  # never drawn; it is how the seam finds this window
+    popup.overrideredirect(True)
     popup.configure(bg=palette.bg)
     popup.attributes("-topmost", True)
 
@@ -246,7 +236,7 @@ def show_hover_popup(
         _section(frame, section, theme, top_pad=0 if index == 0 else 8)
 
     _place(popup, rect, work_area)
-    popup.deiconify()
+    _show_without_activating(popup)
     return popup
 
 

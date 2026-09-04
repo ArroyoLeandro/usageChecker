@@ -47,6 +47,7 @@ __all__ = [
     "set_app_user_model_id",
     "subprocess_flags",
     "work_area_bounds",
+    "work_area_for_rect",
     "open_in_file_manager",
     "startup_supported",
     "is_startup_enabled",
@@ -54,7 +55,7 @@ __all__ = [
     "app_data_root",
     "tray_hover_supported",
     "tray_handle_attribute",
-    "tooltip_window_style",
+    "present_window_without_activating",
     "tray_icon_rect",
     "cursor_position",
     "read_secret",
@@ -93,6 +94,26 @@ def work_area_bounds() -> WorkArea | None:
     determined on this platform (an explicit "I don't know", replacing the
     legacy `(0, 0, 0, 0)` sentinel, which looked like a valid rect)."""
     return _backend.work_area_bounds()
+
+
+def work_area_for_rect(rect: Rect) -> WorkArea | None:
+    """Return the usable desktop rectangle of the display that `rect` sits
+    on, or `None` if it cannot be determined.
+
+    `work_area_bounds()` answers for the primary display and nothing else,
+    which is the wrong question as soon as a second monitor exists: a window
+    meant to appear beside the tray icon has to be clamped against the
+    monitor the *icon* is on, otherwise it is dragged back to the primary
+    display -- reported as "los popups me salen siempre en la principal".
+    Pass the icon's rectangle and get that monitor's work area.
+
+    Falls back to `work_area_bounds()` when no display contains `rect` (a
+    monitor unplugged between reading the rect and asking this, say), and to
+    `None` where even that cannot be known. Same contract as
+    `work_area_bounds()`: coordinates are top-left origin with y growing
+    downward, matching Tk and `tray_icon_rect()`.
+    """
+    return _backend.work_area_for_rect(rect)
 
 
 def open_in_file_manager(path: Path) -> None:
@@ -155,39 +176,38 @@ def tray_handle_attribute() -> str | None:
     return _backend.tray_handle_attribute()
 
 
-def tooltip_window_style() -> tuple[str, tuple[str, ...]] | None:
-    """The window class this platform wants a tooltip surface declared as, or
-    `None` where an ordinary borderless window is already correct.
+def present_window_without_activating(window_title: str) -> bool:
+    """Put the already-built, still-unmapped window titled `window_title` on
+    screen without activating the application. Returns whether it did.
 
-    `None` on Windows and Linux. On macOS, `("help", ())` -- the Aqua window
-    class for a tooltip, which the UI layer hands to Tk's
-    `::tk::unsupported::MacWindowStyle`.
+    `False` on Windows and Linux -- nothing to do there, and the caller shows
+    the window the ordinary way. `True` on macOS when the window was found
+    and ordered in.
 
-    This exists because of a genuine OS fact, not a toolkit quirk: on Aqua,
-    mapping an ordinary window *activates the application*, and activating an
-    application makes macOS switch the user to the Space where that
-    application's windows live. A tooltip that yanks the user off their
-    current Space and onto another monitor because the pointer grazed a
-    menu-bar icon is hostile, and it is exactly what the borderless window
-    used everywhere else does here. A `help`-class window is declared to the
-    window server as a tooltip, and mapping one does not activate anybody.
+    This exists because of an OS fact with real user cost. On Aqua, the
+    normal way to show a window activates the application, and macOS answers
+    an activation by switching the user to the Space where that
+    application's windows live. For a window that appears merely because the
+    pointer grazed a menu-bar icon, that is hostile: it throws the user off
+    their current Space and onto another monitor. AppKit's answer is
+    `orderFrontRegardless`, which shows a window without activating the app
+    or making the window key -- exactly what a tooltip wants, and what the
+    toolkit's own "show this window" path does not do.
 
-    The seam names the class but does not apply it: writing it means calling
-    into Tcl, and this package is deliberately free of tkinter (see
-    `tray_handle_attribute()`, which strikes the same bargain with pystray).
-    What *is* an OS fact is that this platform distinguishes tooltip windows
-    from ordinary ones at all, and that is what this answers.
+    `window_title` is an opaque identifier, not something a user reads: the
+    caller sets it on a borderless window where no title is ever drawn, and
+    guarantees it is unique within the process. It is the handle because the
+    seam has no other way to name one window among the application's many --
+    and asking a *toolkit* for its native window pointer is toolkit
+    business, not the OS's, the same bargain `tray_handle_attribute()`
+    strikes with pystray. Passing a title nothing matches is not an error;
+    it answers `False`, and the caller falls back.
 
-    The attribute tuple is empty on purpose and is not a placeholder for
-    `noActivates`. Measured on Tk 8.6.18 / macOS 26.6 over repeated trials,
-    passing *any* attribute list alongside the class re-applies the window's
-    attributes after it has been created, and that re-application is itself
-    what activates the app -- `("help", ("noActivates",))` activated on 9 of
-    10 runs, while `("help", ())` activated on 0 of 12. The tuple stays in the
-    signature because the class/attributes pair is the shape Aqua actually
-    has, and a future surface may need one.
+    Call this instead of the toolkit's show/deiconify, not in addition to
+    it: the point is to skip the activating path entirely, so a caller that
+    does both gets the activation back.
     """
-    return _backend.tooltip_window_style()
+    return _backend.present_window_without_activating(window_title)
 
 
 def tray_icon_rect(handle: TrayHandle) -> Rect | None:

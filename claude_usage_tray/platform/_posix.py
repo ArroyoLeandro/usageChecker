@@ -26,6 +26,12 @@ def work_area_bounds() -> WorkArea | None:
     return None
 
 
+def work_area_for_rect(rect: Rect) -> WorkArea | None:
+    # Same honest "I don't know" as `work_area_bounds()`: there is no work
+    # area query here, so there is no per-monitor one either.
+    return None
+
+
 def open_in_file_manager(path: Path) -> None:
     try:
         subprocess.Popen(["xdg-open", str(path)])
@@ -59,10 +65,11 @@ def tray_handle_attribute() -> str | None:
     return None
 
 
-def tooltip_window_style() -> tuple[str, tuple[str, ...]] | None:
-    # Same as Windows: nothing to declare. Also moot in practice, since
-    # `tray_hover_supported()` is False here and the native tooltip stands.
-    return None
+def present_window_without_activating(window_title: str) -> bool:
+    # As on Windows: no activation to avoid, so the caller shows the window
+    # the ordinary way. Moot in practice anyway -- `tray_hover_supported()`
+    # is False here and the native tooltip stands.
+    return False
 
 
 def tray_icon_rect(handle: TrayHandle) -> Rect | None:

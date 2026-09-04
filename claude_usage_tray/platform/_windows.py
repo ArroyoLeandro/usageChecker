@@ -8,6 +8,7 @@ here so it is never even imported on another OS.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import subprocess
 import winreg
@@ -15,6 +16,8 @@ from ctypes import wintypes
 from pathlib import Path
 
 from ._types import FileManagerError, Rect, TrayHandle, WorkArea
+
+log = logging.getLogger(__name__)
 
 STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "ClaudeUsage"
@@ -82,6 +85,59 @@ def work_area_bounds() -> WorkArea | None:
     return WorkArea(rect.left, rect.top, rect.right, rect.bottom)
 
 
+def work_area_for_rect(rect: Rect) -> WorkArea | None:
+    """`SPI_GETWORKAREA` answers for the primary display only, so ask the
+    monitor that actually contains `rect` instead.
+
+    `MonitorFromPoint` with `MONITOR_DEFAULTTONEAREST` never fails to name a
+    monitor, and `GetMonitorInfoW`'s `rcWork` is that monitor's work area --
+    the taskbar and any docked app bars already subtracted, which is the
+    whole point of preferring it to the raw monitor bounds.
+
+    Falls back to `work_area_bounds()` if the calls do not succeed, so a
+    refusal costs the old primary-display behaviour rather than an exception
+    on the UI thread.
+    """
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", wintypes.LONG),
+            ("top", wintypes.LONG),
+            ("right", wintypes.LONG),
+            ("bottom", wintypes.LONG),
+        ]
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", RECT),
+            ("rcWork", RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    MONITOR_DEFAULTTONEAREST = 0x00000002
+    try:
+        # The centre, not a corner: a tray icon sits flush against a screen
+        # edge, where a corner can land on the neighbouring monitor.
+        point = POINT(rect.left + rect.width // 2, rect.top + rect.height // 2)
+        monitor = ctypes.windll.user32.MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
+        if not monitor:
+            return work_area_bounds()
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if not ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return work_area_bounds()
+    except Exception:
+        log.warning("could not read the monitor for %r; using the primary work area", rect, exc_info=True)
+        return work_area_bounds()
+
+    work = info.rcWork
+    return WorkArea(left=work.left, top=work.top, right=work.right, bottom=work.bottom)
+
+
 def open_in_file_manager(path: Path) -> None:
     try:
         os.startfile(str(path))  # type: ignore[attr-defined]
@@ -130,11 +186,11 @@ def tray_handle_attribute() -> str | None:
     return "_hwnd"
 
 
-def tooltip_window_style() -> tuple[str, tuple[str, ...]] | None:
-    # No window-class distinction to make: a borderless topmost window is
-    # already a correct tooltip here, and showing one does not steal
-    # activation the way Aqua does.
-    return None
+def present_window_without_activating(window_title: str) -> bool:
+    # Nothing to route around: showing a window here does not activate the
+    # process the way Aqua does, so the caller's ordinary show path is
+    # already correct. `False` tells it to use that path.
+    return False
 
 
 def tray_icon_rect(handle: TrayHandle) -> Rect | None:
