@@ -220,6 +220,159 @@ def contrast_ratio(foreground: str, background: str) -> float:
     return (lighter + 0.05) / (darker + 0.05)
 
 
+# ---------------------------------------------------------------------------
+# Interaction shades
+#
+# A button has to look different while the pointer is over it and different
+# again while it is held down, and those two surfaces cannot be palette
+# fields: the palette has nine colors and `ui/widgets.py` builds buttons on
+# `bg`, `panel`, `accent` and -- in the colour picker -- on whatever hex the
+# user just typed. There is no table that covers that; the shades have to be
+# *derived* from the background the call site passes, or a user whose accent
+# is green gets an orange hover.
+#
+# They live here, next to `contrast_ratio`, for the same reason parsing does:
+# they are palette facts, they are pure, and they are decidable with no
+# display -- which is the only way any of this gets tested at all.
+# ---------------------------------------------------------------------------
+
+_WHITE = "#ffffff"
+_BLACK = "#000000"
+
+# How far toward that extreme each state moves. Small on purpose: these are
+# feedback, not a second palette. The pressed step is roughly twice the hover
+# step so the two read as one gesture deepening rather than two colors.
+HOVER_MIX = 0.09
+PRESSED_MIX = 0.18
+
+# How far a disabled label falls back toward its own surface.
+DISABLED_MIX = 0.55
+
+# The contrast a surface must have against an extreme for a `PRESSED_MIX`
+# step toward it to be *visible*. Below this the surface is already sitting
+# on that extreme and the step rounds away to nothing: `#fbfaf7` moved 9% of
+# the way to white is `#fbfaf7` again. 2:1 is the point where a 9% step is
+# still a couple of levels per channel on every palette this app ships.
+MIN_SHADE_CONTRAST = 2.0
+
+# WCAG 2.x 1.4.11 (non-text contrast): what a focus ring, being a graphical
+# indicator rather than text, has to clear. Distinct from
+# `AA_CONTRAST_RATIO` above, which governs label text at 4.5:1.
+RING_MIN_CONTRAST = 3.0
+
+
+def mix_colors(color: str, other: str, amount: float) -> str:
+    """Blend `color` `amount` of the way toward `other`, per channel.
+
+    `amount` is clamped to `[0, 1]`; 0 returns `color`, 1 returns `other`.
+    Raises `ValueError` on an unparseable input, like `relative_luminance`
+    and for the same reason -- both ends come off a `Palette` or off a value
+    `parse_hex_color` already accepted.
+
+    Linear in sRGB space rather than in luminance: this is a nudge of a
+    surface, not a contrast calculation, and sRGB is the space the result is
+    handed back to Tk in. Doing it in linear light would make the same
+    `amount` produce visibly different steps on dark and light palettes.
+    """
+    start, end = parse_hex_color(color), parse_hex_color(other)
+    if start is None:
+        raise ValueError(f"not a hex color: {color!r}")
+    if end is None:
+        raise ValueError(f"not a hex color: {other!r}")
+    ratio = min(1.0, max(0.0, amount))
+    channels = (
+        round(
+            int(start[index : index + 2], 16)
+            + (int(end[index : index + 2], 16) - int(start[index : index + 2], 16)) * ratio
+        )
+        for index in (1, 3, 5)
+    )
+    return "#" + "".join(f"{channel:02x}" for channel in channels)
+
+
+def shade_target(background: str, foreground: str) -> str:
+    """Which extreme -- `#000000` or `#ffffff` -- `background` shades toward.
+
+    The first choice is *away from the text*: moving the surface away from
+    the colour written on it can only make the label easier to read while it
+    is being pressed, never harder.
+
+    The second choice overrules it when the first has nowhere to go. A
+    surface already near an extreme has no room to move further that way --
+    `panel` in the light preset is `#fbfaf7`, and 9% of the remaining
+    distance to white is less than one level per channel, so "away from the
+    dark text" would render a button that does not visibly react at all.
+    `MIN_SHADE_CONTRAST` is the test for that, and it is measured with
+    `contrast_ratio` rather than by comparing hex values so the answer is the
+    same fact the rest of this module reasons in.
+
+    Both branches matter in practice. A user running a `#000000` panel gets
+    the second (black has no room to darken, so its buttons lighten); the
+    default dark preset gets it too; a saturated accent like `#11a800` under
+    light text gets the first, and deepens.
+    """
+    away = _BLACK if relative_luminance(foreground) > relative_luminance(background) else _WHITE
+    if contrast_ratio(background, away) >= MIN_SHADE_CONTRAST:
+        return away
+    return _WHITE if away == _BLACK else _BLACK
+
+
+def interaction_shades(background: str, foreground: str) -> tuple[str, str]:
+    """The `(hover, pressed)` surfaces for a button drawn `foreground`-on-`background`.
+
+    Derived, never looked up: the caller's own `background` is the only input
+    that decides the hue, so a custom accent shades to itself and a custom
+    panel shades to itself. The pair is always two *distinct* colours -- that
+    is the whole defect being fixed, since the buttons this replaces set
+    `activebackground` equal to their own background and therefore
+    acknowledged a click with nothing at all.
+    """
+    target = shade_target(background, foreground)
+    return mix_colors(background, target, HOVER_MIX), mix_colors(background, target, PRESSED_MIX)
+
+
+def disabled_foreground(foreground: str, background: str) -> str:
+    """The label colour of a disabled button: `foreground`, half dissolved into its surface.
+
+    Dimming toward the *surface* rather than toward grey is what keeps this
+    honest on a custom palette -- a fixed grey would be a foreign colour on a
+    green button and, on a grey panel, would not read as disabled at all.
+    """
+    return mix_colors(foreground, background, DISABLED_MIX)
+
+
+def focus_ring(background: str, *candidates: str) -> str:
+    """The first of `candidates` visible enough to ring `background`, else the most visible.
+
+    A keyboard focus ring that cannot be seen is not a focus ring, so this
+    ends in a guarantee: black and white are appended to whatever the caller
+    offered, and one of them always clears the floor -- the worst possible
+    surface still measures 4.58:1 against the better of the two. Nothing a
+    user can put in a palette can produce an invisible ring.
+
+    *First* clearing the floor rather than *most* contrasting, because these
+    are ranked by intent and not only by measurement. A ring in the button's
+    own text colour looks deliberate; a black ring is merely legible. Taking
+    the maximum would pick black nearly every time and throw the palette
+    away, so the palette wins whenever it is good enough and only then.
+
+    Two candidates cannot be assumed to work and are why this is measured at
+    all: the colour-picker swatches pass a foreground that *is* their
+    background, and `accent` on the dark preset carries `fg` at 2.83:1 --
+    documented above as a conceded tradeoff, and below this floor.
+
+    `RING_MIN_CONTRAST` is WCAG 2.x 1.4.11, which governs non-text
+    indicators like this one rather than the 4.5:1 that governs label text.
+    """
+    if not candidates:
+        raise ValueError("focus_ring needs at least one candidate")
+    ranked = (*candidates, _WHITE, _BLACK)
+    for candidate in ranked:
+        if contrast_ratio(candidate, background) >= RING_MIN_CONTRAST:
+            return candidate
+    return max(ranked, key=lambda candidate: contrast_ratio(candidate, background))
+
+
 # WCAG 2.x AA for normal-size text. The built-in presets are gated on this as
 # a hard test failure (`tests/test_theme.py`); a user's own colors are only
 # *warned* about, never blocked -- see `contrast_report`.

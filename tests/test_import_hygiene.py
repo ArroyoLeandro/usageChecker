@@ -64,6 +64,13 @@ CLEAN_MODULES = [
     # and therefore whether switching preset still works -- is testable with
     # no colour picker to open.
     "claude_usage_tray.ui.colors",
+    # Everything `widgets.FlatButton` decides: which surface belongs to which
+    # interaction state, whether a release counts as a click, and which
+    # `configure()` options the button answers instead of forwarding. The
+    # button exists because Tk on macOS ignores every colour option on a
+    # `tk.Button`, so it is hand-written -- and a hand-written button is only
+    # as trustworthy as the part of it a display-less box can still check.
+    "claude_usage_tray.ui.button_state",
     # The MCP server's three non-fetching modules. `server.py` is absent
     # from this list on purpose -- it reaches `api.py`, and therefore
     # `requests`, which is the whole reason the rest of the package is

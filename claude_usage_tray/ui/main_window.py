@@ -108,8 +108,7 @@ def _build_tab_strip(
             font_role="body_bold" if selected else "body",
             padx=16,
             pady=7,
-            highlightthickness=0 if selected else 1,
-            highlightbackground=None if selected else palette.border,
+            border=None if selected else palette.border,
         ).pack(side="left", padx=(0, 8))
 
 
