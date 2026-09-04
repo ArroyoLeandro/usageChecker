@@ -575,6 +575,18 @@ class UsageTrayApp:
 
         self._native_tooltip = False
         self._apply_to_tray(title="")
+        # Build the hover popup's window now rather than on the first hover.
+        # Creating it is what momentarily takes the front from whatever the
+        # user is in, and a hover is the worst possible moment for that: the
+        # pointer is at the menu bar and the user may be inside a full-screen
+        # Space. Here, we have just finished promoting the tray icon, so the
+        # cost is paid once and out of the user's way. Failure is not fatal
+        # -- `show_hover_popup` still builds one lazily.
+        try:
+            self._hover_popup = ui.create_hover_popup(self._root, theme=self._theme)
+        except Exception:
+            log.exception("could not pre-build the hover popup; it will be built on demand")
+            self._hover_popup = None
         # Held on the instance, not just closed over by the tracker: the
         # usage popup needs the same rectangle to know which display to open
         # on, and it is opened by a click, nowhere near the hover path.
@@ -704,9 +716,14 @@ class UsageTrayApp:
             self._fall_back_to_native_tooltip("the hover popup could not be built")
 
     def _hide_hover_popup(self) -> None:
-        popup, self._hover_popup = self._hover_popup, None
+        # The reference is deliberately kept: the hover popup's window
+        # outlives the show. Dropping it here would mean the next enter edge
+        # builds a fresh one, and building one both takes the front from the
+        # user's application and starts out unmapped -- the two failures this
+        # surface exists to avoid. `hide_hover_popup` only takes it off
+        # screen.
         try:
-            ui.hide_hover_popup(popup)
+            ui.hide_hover_popup(self._hover_popup)
         except Exception:
             log.exception("could not hide the hover popup")
 

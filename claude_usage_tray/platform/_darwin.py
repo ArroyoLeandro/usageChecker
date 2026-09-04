@@ -335,12 +335,140 @@ def _is_on_a_screen(origin_x: float, origin_y: float, width: float, height: floa
     return False
 
 
+def _window_titled(window_title: str) -> Any | None:
+    """The application's NSWindow whose title is `window_title`, or `None`.
+
+    A window title is the only handle the seam has on one window among the
+    application's own -- see `present_window_without_activating`. AppKit is
+    imported inside the function for the reason `work_area_bounds` spells
+    out: this seam is pulled in by headless code paths and must not drag a
+    GUI framework into every import of the package.
+    """
+    try:
+        from AppKit import NSApp
+    except Exception:
+        return None
+
+    app = NSApp()
+    if app is None:
+        return None
+
+    for window in app.windows():
+        if window.title() == window_title:
+            return window
+    return None
+
+
+def preserve_frontmost_application(action: Callable[[], None]) -> None:
+    """Run `action`, then hand the front back to whichever app had it.
+
+    Creating a Tk `Toplevel` on Aqua activates the application -- measured on
+    Tk 8.6.18 / macOS 26.6, reading `NSWorkspace.frontmostApplication()`
+    before and after: the front moves to us the moment the window exists,
+    before any content is built and before it is ever shown. That is the
+    activation the user feels as being thrown onto another Space, so a window
+    that must never steal the front has to be built inside this.
+
+    `NSApp.deactivate()` does *not* undo it (measured: the front stayed on us
+    for the full second afterwards). Re-activating the previous application
+    explicitly does, and is what this uses.
+
+    The front is restored, not prevented: there is a brief moment where we
+    hold it. Build the window once, at a moment the user is not mid-gesture,
+    rather than on every show.
+    """
+    try:
+        from AppKit import NSWorkspace
+
+        previous = NSWorkspace.sharedWorkspace().frontmostApplication()
+    except Exception:
+        previous = None
+
+    try:
+        action()
+    finally:
+        if previous is not None:
+            try:
+                if not previous.isActive():
+                    previous.activateWithOptions_(0)
+            except Exception:
+                log.warning("could not hand the front back to %s", previous, exc_info=True)
+
+
+def prepare_overlay_window(window_title: str) -> bool:
+    """Make the window titled `window_title` a click-through overlay that
+    follows the user across every Space. Returns whether it was found.
+
+    Three separate facts, all of them about a window that exists to be looked
+    at and never touched:
+
+    - **`ignoresMouseEvents`.** This window stays alive and mapped for the
+      whole session (that is what keeps its content drawn), so while hidden
+      it is still a window sitting at the top level. Without this it would
+      swallow clicks aimed at whatever is underneath.
+    - **`hidesOnDeactivate`.** Floating windows default to hiding for as long
+      as the app is inactive -- that is, always, for a tray app that never
+      takes the front.
+    - **`collectionBehavior`.** `CanJoinAllSpaces` carries the window between
+      *desktop* Spaces; `FullScreenAuxiliary` is what additionally lets it
+      draw over the Space of an app running full screen. Read-modify-write,
+      never assignment: Tk sets bits of its own here and overwriting them is
+      how a window quietly loses its level. `MoveToActiveSpace` is cleared in
+      the same breath because AppKit raises
+      `NSInternalInconsistencyException` if it is set alongside
+      `CanJoinAllSpaces` -- they are mutually exclusive answers to the same
+      question.
+    """
+    window = _window_titled(window_title)
+    if window is None:
+        return False
+
+    try:
+        from AppKit import (
+            NSWindowCollectionBehaviorCanJoinAllSpaces,
+            NSWindowCollectionBehaviorFullScreenAuxiliary,
+            NSWindowCollectionBehaviorMoveToActiveSpace,
+        )
+    except Exception:
+        return False
+
+    window.setIgnoresMouseEvents_(True)
+    window.setHidesOnDeactivate_(False)
+
+    behavior = int(window.collectionBehavior())
+    behavior &= ~int(NSWindowCollectionBehaviorMoveToActiveSpace)
+    behavior |= int(NSWindowCollectionBehaviorCanJoinAllSpaces)
+    behavior |= int(NSWindowCollectionBehaviorFullScreenAuxiliary)
+    window.setCollectionBehavior_(behavior)
+    return True
+
+
+def hide_window_without_unmapping(window_title: str) -> bool:
+    """Take the window titled `window_title` off screen at the Cocoa level,
+    leaving the toolkit's own map state alone. Returns whether it was found.
+
+    The counterpart to `present_window_without_activating`, and it exists for
+    the same reason that one does. Tk's own way to hide a window (`withdraw`)
+    unmaps it, and an unmapped window's children are not laid out or drawn --
+    so a window hidden that way and later shown through AppKit comes back as
+    an empty rectangle of the right size. `orderOut:` removes the window from
+    the screen without telling Tk anything, so the content it already drew
+    survives to the next show.
+
+    Measured on Tk 8.6.18 / macOS 26.6, reading the compositor's own
+    on-screen list from a separate process: after `orderOut:` the window is
+    absent from that list entirely, while `winfo_ismapped()` stays true for
+    the window and all 21 of its descendants.
+    """
+    window = _window_titled(window_title)
+    if window is None:
+        return False
+    window.orderOut_(None)
+    return True
+
+
 def present_window_without_activating(window_title: str) -> bool:
     """`orderFrontRegardless` the NSWindow carrying `window_title`.
-
-    AppKit is imported inside the function for the reason `work_area_bounds`
-    spells out: this seam is pulled in by headless code paths and must not
-    drag a GUI framework into every import of the package.
 
     Measured on Tk 8.6.18 / macOS 26.6, from a fresh process each time,
     reading the compositor's own on-screen window list from a *separate*
@@ -351,31 +479,30 @@ def present_window_without_activating(window_title: str) -> bool:
       toolkit's own show path   visible, but activated the app 10 of 10
       orderFrontRegardless      visible and activated 0 of 5
 
+    This shows a window; it does not *render* one. AppKit will happily order
+    in a window the toolkit has never mapped, and the result is a correctly
+    sized, correctly placed, entirely empty rectangle -- measured:
+    `winfo_ismapped()` false for the window and for 0 of its 21 descendants,
+    while the compositor reported it on screen at exactly the requested
+    geometry. That empty box is what reached a user. The caller must
+    therefore keep the window mapped, which is what
+    `hide_window_without_unmapping` is for.
+
     `isVisible` is NOT a usable check here and was what misled an earlier
     attempt: it answers `True` for a window the window server is not
     compositing at all. Only the on-screen list, read from outside, tells
-    the truth.
+    the truth -- and, as above, not the whole of it.
     """
-    try:
-        from AppKit import NSApp
-    except Exception:
+    window = _window_titled(window_title)
+    if window is None:
         return False
-
-    app = NSApp()
-    if app is None:
-        return False
-
-    for window in app.windows():
-        if window.title() != window_title:
-            continue
-        # Floating/panel-level windows default to hidesOnDeactivate, which
-        # would hide this one for exactly as long as the app stays inactive
-        # -- that is, always, which is the whole point. Clearing it costs
-        # nothing on a window that never had it set.
-        window.setHidesOnDeactivate_(False)
-        window.orderFrontRegardless()
-        return True
-    return False
+    # Floating/panel-level windows default to hidesOnDeactivate, which would
+    # hide this one for exactly as long as the app stays inactive -- that is,
+    # always, which is the whole point. Clearing it costs nothing on a window
+    # that never had it set.
+    window.setHidesOnDeactivate_(False)
+    window.orderFrontRegardless()
+    return True
 
 
 def tray_icon_rect(handle: TrayHandle) -> Rect | None:

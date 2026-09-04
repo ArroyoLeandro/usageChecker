@@ -307,6 +307,28 @@ def test_tray_handle_attribute_is_pystrays_status_item_on_macos():
     assert platform.tray_handle_attribute() == "_status_item"
 
 
+def _attached_displays_in_tk_space():
+    """Every attached display as `(left, top, right, bottom)` in Tk's space.
+
+    Tk's origin is the top left of the *primary* display with y growing down;
+    Cocoa's is the bottom left of that same display with y growing up. So
+    every screen's frame flips against the primary's height -- and only the
+    primary's, which is the whole point of doing it here rather than per
+    screen.
+    """
+    from AppKit import NSScreen
+
+    flip = NSScreen.screens()[0].frame().size.height
+    for screen in NSScreen.screens():
+        frame = screen.frame()
+        yield (
+            int(frame.origin.x),
+            int(flip - (frame.origin.y + frame.size.height)),
+            int(frame.origin.x + frame.size.width),
+            int(flip - frame.origin.y),
+        )
+
+
 @pytest.mark.skipif(not IS_DARWIN, reason="macOS-only: NSEvent.mouseLocation")
 def test_cursor_position_is_readable_on_macos():
     point = platform.cursor_position()
@@ -316,8 +338,18 @@ def test_cursor_position_is_readable_on_macos():
     # Cocoa's y grows upward from the bottom of the screen, Tk's downward
     # from the top. Dropping the flip would put the cursor off the bottom of
     # a tall screen far more often than not, but the honest check is simply
-    # that the point lands on the desktop.
-    assert 0 <= y <= _main_screen_height()
+    # that the point lands on *some* attached display.
+    #
+    # Not "on the primary display": the origin of this coordinate space is
+    # the primary display's top left, so a monitor placed above or to the
+    # left of it has negative coordinates throughout, and a cursor sitting
+    # there is a perfectly ordinary desktop. Asserting `0 <= y` failed on a
+    # real three-display arrangement with the pointer on the upper monitor
+    # (y=-1027) -- a correct reading that the assertion called a bug.
+    assert any(
+        left <= x < right and top <= y < bottom
+        for left, top, right, bottom in _attached_displays_in_tk_space()
+    ), f"cursor at ({x}, {y}) is on no attached display"
 
 
 @pytest.mark.skipif(not IS_DARWIN, reason="macOS-only: NSStatusBar")

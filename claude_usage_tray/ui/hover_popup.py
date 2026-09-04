@@ -22,6 +22,13 @@ Two things it deliberately does NOT do, both of which the usage popup does:
   click. Registering here would mean a click anywhere destroys a window the
   tracker still believes is open, and the next enter edge would be a no-op
   against a dead handle.
+
+One thing it does that no other window here does: it keeps its `Toplevel`
+for the whole session instead of destroying it on every hide. That is not a
+performance choice, it is the only arrangement in which the popup is both
+visible *and* silent -- see `create_hover_popup` for the two measurements
+that force it. The contents are still rebuilt from scratch on every show, so
+theming behaves exactly as it does everywhere else.
 """
 
 from __future__ import annotations
@@ -31,7 +38,14 @@ import tkinter as tk
 from typing import Any
 
 from .. import formatting
-from ..platform import Rect, WorkArea, present_window_without_activating
+from ..platform import (
+    Rect,
+    WorkArea,
+    hide_window_without_unmapping,
+    prepare_overlay_window,
+    present_window_without_activating,
+    preserve_frontmost_application,
+)
 from ..theme import DEFAULT_THEME, Theme
 
 log = logging.getLogger(__name__)
@@ -136,9 +150,9 @@ def _show_without_activating(popup: tk.Toplevel) -> None:
     platform. On Aqua it activates the application, and macOS answers an
     activation by switching the user to the Space where that application's
     windows live -- so hovering a menu-bar icon threw the user onto another
-    Space and monitor, reported as "me mueve a la pantalla principal". The
-    seam routes around it where that is a real problem and declines
-    everywhere else, which is why this is a fallback and not a branch.
+    Space, reported as "me mueve a la pantalla principal". The seam routes
+    around it where that is a real problem and declines everywhere else,
+    which is why this is a fallback and not a branch.
 
     The two paths are alternatives, never both: the seam's path works
     precisely by not going through the activating one, so calling
@@ -150,6 +164,7 @@ def _show_without_activating(popup: tk.Toplevel) -> None:
     `deiconify()`, which is what shipped before and is merely the old
     behaviour, not a broken one.
     """
+    popup.attributes("-alpha", 1.0)
     try:
         if present_window_without_activating(_WINDOW_TITLE):
             return
@@ -201,6 +216,74 @@ def _place(popup: tk.Toplevel, rect: Rect, work_area: WorkArea | None) -> None:
     popup.geometry(f"{width}x{height}+{x}+{y}")
 
 
+def create_hover_popup(root: tk.Misc, *, theme: Theme = DEFAULT_THEME) -> tk.Toplevel:
+    """Build the popup's window once, mapped and invisible, ready to be shown.
+
+    This window is created once per session and then kept, which is a
+    deliberate break from the destroy-and-rebuild every other window here
+    uses. Two measured facts force it, and neither is negotiable:
+
+    - **A window the toolkit has not mapped draws nothing.** Showing it
+      through the seam's non-activating path put a correctly sized,
+      correctly placed, completely empty rectangle on screen -- `winfo_
+      ismapped()` false for the popup and for 0 of its 21 descendants. That
+      grey box is what reached a user. Only a mapped window lays out and
+      paints its children, so the window has to *stay* mapped, and hiding it
+      becomes `hide_window_without_unmapping()` rather than `withdraw()`.
+    - **Creating the window is what steals the front, not showing it.**
+      Measured: the front moves to us at `tk.Toplevel(...)`, before any
+      content exists. So creation happens once, inside
+      `preserve_frontmost_application()`, at a moment of our choosing --
+      rather than on every hover, which is exactly the gesture that must
+      never move the user.
+
+    Born at `-alpha 0.0` so the one map it does undergo is invisible; it is
+    ordered off screen immediately afterwards and only alpha and window
+    order distinguish shown from hidden from then on.
+
+    Content is *not* built here. It is rebuilt on every show, which is what
+    keeps a theme change -- including a custom hex palette -- applying with
+    no live-mutation machinery, exactly as destroy-and-rebuild did.
+    """
+    popup: dict[str, tk.Toplevel] = {}
+
+    def build() -> None:
+        window = tk.Toplevel(root)
+        # Invisible from birth. There is no `withdraw()` here on purpose:
+        # withdrawing is what leaves the window unmapped and empty.
+        window.attributes("-alpha", 0.0)
+        window.title(_WINDOW_TITLE)  # never drawn; it is how the seam finds it
+        window.overrideredirect(True)
+        window.configure(bg=theme.palette.bg)
+        window.attributes("-topmost", True)
+        # Forces the map now, while nothing can be seen, so every later show
+        # is a window that has already laid itself out.
+        window.update_idletasks()
+        popup["window"] = window
+
+    preserve_frontmost_application(build)
+    window = popup["window"]
+
+    prepare_overlay_window(_WINDOW_TITLE)
+    _hide_without_unmapping(window)
+    return window
+
+
+def _hide_without_unmapping(popup: tk.Toplevel) -> None:
+    """Take `popup` off screen, leaving the toolkit's map state alone."""
+    popup.attributes("-alpha", 0.0)
+    try:
+        if hide_window_without_unmapping(_WINDOW_TITLE):
+            return
+    except Exception:
+        log.warning(
+            "could not hide the hover popup without unmapping it; "
+            "falling back to withdraw",
+            exc_info=True,
+        )
+    popup.withdraw()
+
+
 def show_hover_popup(
     root: tk.Misc,
     data: dict[str, Any],
@@ -210,21 +293,21 @@ def show_hover_popup(
     existing: tk.Toplevel | None = None,
     work_area: WorkArea | None = None,
 ) -> tk.Toplevel:
-    """Build and show the hover popup anchored to the tray icon at `rect`.
+    """Show the hover popup, anchored to the tray icon at `rect`.
 
-    Destroy-and-rebuild on every show, like every other window here, which is
-    what makes a theme change -- including a custom hex palette -- apply with
-    no live-mutation machinery at all.
+    Reuses `existing` when it is still alive and creates the window
+    otherwise -- see `create_hover_popup` for why the window outlives the
+    show. The *contents* are still destroyed and rebuilt every time, which is
+    what makes a theme change apply with no live-mutation machinery.
     """
-    hide_hover_popup(existing)
+    popup = existing if existing is not None and existing.winfo_exists() else None
+    if popup is None:
+        popup = create_hover_popup(root, theme=theme)
 
     palette = theme.palette
-    popup = tk.Toplevel(root)
-    popup.withdraw()  # place it before it is ever seen, so it cannot flash
-    popup.title(_WINDOW_TITLE)  # never drawn; it is how the seam finds this window
-    popup.overrideredirect(True)
+    for child in popup.winfo_children():
+        child.destroy()
     popup.configure(bg=palette.bg)
-    popup.attributes("-topmost", True)
 
     shell = tk.Frame(popup, bg=palette.border, padx=1, pady=1)
     shell.pack(fill="both", expand=True)
@@ -235,12 +318,20 @@ def show_hover_popup(
     for index, section in enumerate(formatting.hover_sections(data)):
         _section(frame, section, theme, top_pad=0 if index == 0 else 8)
 
+    # Placed while still invisible and still off screen, so the move from
+    # the previous show's position is never seen.
     _place(popup, rect, work_area)
     _show_without_activating(popup)
     return popup
 
 
 def hide_hover_popup(popup: tk.Toplevel | None) -> None:
-    """Destroy `popup` if it still exists. Idempotent, and `None`-tolerant."""
+    """Take `popup` off screen if it still exists. Idempotent, `None`-tolerant.
+
+    Deliberately does not destroy it. The window is the session's, not this
+    show's: destroying it would mean building a new one on the next hover,
+    and building one both steals the front and starts out unmapped -- the two
+    things this surface exists to avoid. See `create_hover_popup`.
+    """
     if popup is not None and popup.winfo_exists():
-        popup.destroy()
+        _hide_without_unmapping(popup)

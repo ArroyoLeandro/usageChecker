@@ -38,6 +38,7 @@ __all__ = [
     "HoverTracker",
     "TAB_PROFILES",
     "TAB_SETTINGS",
+    "create_hover_popup",
     "show_hover_popup",
     "show_main_window",
     "show_popup",
@@ -62,6 +63,10 @@ def __getattr__(name: str) -> Any:
         from . import main_window
 
         return getattr(main_window, name)
+    if name == "create_hover_popup":
+        from .hover_popup import create_hover_popup
+
+        return create_hover_popup
     if name == "show_hover_popup":
         from .hover_popup import show_hover_popup
 

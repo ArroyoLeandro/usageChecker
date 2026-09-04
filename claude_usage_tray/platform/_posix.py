@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from ._types import FileManagerError, PlatformUnsupportedError, Rect, TrayHandle, WorkArea
 
@@ -69,6 +70,26 @@ def present_window_without_activating(window_title: str) -> bool:
     # As on Windows: no activation to avoid, so the caller shows the window
     # the ordinary way. Moot in practice anyway -- `tray_hover_supported()`
     # is False here and the native tooltip stands.
+    return False
+
+
+def preserve_frontmost_application(action: Callable[[], None]) -> None:
+    # Creating a window here does not take the front from another
+    # application, so there is nothing to hand back: just run the action.
+    action()
+
+
+def prepare_overlay_window(window_title: str) -> bool:
+    # No Spaces to join and no click-through flag to set: a `-topmost` window
+    # already behaves the way the caller wants. `False` is "nothing to do
+    # here", not a failure.
+    return False
+
+
+def hide_window_without_unmapping(window_title: str) -> bool:
+    # The caller only needs this where its own hide path would unmap the
+    # window and stop it drawing, which is an Aqua problem. `False` sends it
+    # back to the ordinary hide.
     return False
 
 

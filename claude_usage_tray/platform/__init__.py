@@ -56,6 +56,9 @@ __all__ = [
     "tray_hover_supported",
     "tray_handle_attribute",
     "present_window_without_activating",
+    "preserve_frontmost_application",
+    "prepare_overlay_window",
+    "hide_window_without_unmapping",
     "tray_icon_rect",
     "cursor_position",
     "read_secret",
@@ -177,12 +180,19 @@ def tray_handle_attribute() -> str | None:
 
 
 def present_window_without_activating(window_title: str) -> bool:
-    """Put the already-built, still-unmapped window titled `window_title` on
-    screen without activating the application. Returns whether it did.
+    """Put the already-built window titled `window_title` on screen without
+    activating the application. Returns whether it did.
 
     `False` on Windows and Linux -- nothing to do there, and the caller shows
     the window the ordinary way. `True` on macOS when the window was found
     and ordered in.
+
+    Shows a window; does not render one. The window must already be *mapped*
+    by the toolkit, or this puts an empty rectangle on screen -- correct size,
+    correct position, no content, because a toolkit does not lay out or draw
+    a window it considers hidden. Pair it with
+    `hide_window_without_unmapping()`, which is what keeps a window mapped
+    between shows.
 
     This exists because of an OS fact with real user cost. On Aqua, the
     normal way to show a window activates the application, and macOS answers
@@ -208,6 +218,59 @@ def present_window_without_activating(window_title: str) -> bool:
     does both gets the activation back.
     """
     return _backend.present_window_without_activating(window_title)
+
+
+def preserve_frontmost_application(action: Callable[[], None]) -> None:
+    """Run `action`, then give the front back to whichever application had
+    it. A plain `action()` everywhere the act of building a window does not
+    take the front in the first place -- which is everywhere but macOS.
+
+    On Aqua, merely constructing a toolkit window activates the application,
+    before any content exists and before the window is ever shown, and macOS
+    answers an activation by pulling the user to the Space that application
+    lives on. A window that must never do that has to be built inside this.
+
+    The front is *restored*, not withheld: for a moment we hold it. So build
+    such a window once, at a moment of the caller's choosing -- startup --
+    rather than on every show. Never raises: failing to hand the front back
+    is worth a log line, not an exception on the UI thread.
+    """
+    _backend.preserve_frontmost_application(action)
+
+
+def prepare_overlay_window(window_title: str) -> bool:
+    """Make the already-built window titled `window_title` behave as a
+    look-but-do-not-touch overlay: click-through, and present on whatever
+    Space the user is on -- including the Space of an app running full
+    screen. Returns whether the platform did anything.
+
+    `False` is "nothing to do here", not a failure: on Windows and Linux a
+    topmost window already behaves this way, and the caller needs no
+    fallback. Call it once, after the window exists.
+
+    The full-screen half is the part that is easy to miss. A window can be
+    marked to join every *desktop* Space and still refuse to draw over an
+    application running full screen, because that is governed by a separate
+    bit -- and a full-screen app is what a user means by "the tooltip does
+    not show up on the screen I am on".
+    """
+    return _backend.prepare_overlay_window(window_title)
+
+
+def hide_window_without_unmapping(window_title: str) -> bool:
+    """Take the window titled `window_title` off screen without letting the
+    toolkit unmap it. Returns whether it did; `False` means the caller should
+    hide the window its ordinary way.
+
+    The counterpart to `present_window_without_activating`, for the same
+    window and the same reason. The toolkit's own hide unmaps the window, and
+    an unmapped window draws no content at all -- so a window hidden that way
+    and later shown through this seam's non-activating path comes back as an
+    empty rectangle: right size, right place, nothing in it. Keeping the
+    window mapped for the life of the session is what keeps its content
+    drawn, and this is how it is hidden in between.
+    """
+    return _backend.hide_window_without_unmapping(window_title)
 
 
 def tray_icon_rect(handle: TrayHandle) -> Rect | None:
