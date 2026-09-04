@@ -260,6 +260,19 @@ def _is_on_a_screen(origin_x: float, origin_y: float, width: float, height: floa
     return False
 
 
+def tooltip_window_style() -> tuple[str, tuple[str, ...]] | None:
+    # Aqua's own window class for a tooltip. Mapping an ordinary window
+    # activates the app, and activating an app pulls the user to the Space
+    # its windows are on -- so a plain borderless Toplevel used as a hover
+    # tooltip drags the user off their current Space and monitor. A
+    # `help`-class window is not an activating surface.
+    #
+    # No attributes: see the facade's docstring. Passing an attribute list --
+    # `noActivates` included -- re-applies the window's attributes after
+    # creation, and that re-application is what activates the app.
+    return ("help", ())
+
+
 def tray_icon_rect(handle: TrayHandle) -> Rect | None:
     """El rectángulo en pantalla del icono de la barra de menú, o `None`.
 

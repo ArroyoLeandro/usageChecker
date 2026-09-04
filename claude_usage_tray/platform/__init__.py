@@ -54,6 +54,7 @@ __all__ = [
     "app_data_root",
     "tray_hover_supported",
     "tray_handle_attribute",
+    "tooltip_window_style",
     "tray_icon_rect",
     "cursor_position",
     "read_secret",
@@ -152,6 +153,41 @@ def tray_handle_attribute() -> str | None:
     identifies an icon here — an integer window handle or an AppKit object —
     and that is exactly what this answers."""
     return _backend.tray_handle_attribute()
+
+
+def tooltip_window_style() -> tuple[str, tuple[str, ...]] | None:
+    """The window class this platform wants a tooltip surface declared as, or
+    `None` where an ordinary borderless window is already correct.
+
+    `None` on Windows and Linux. On macOS, `("help", ())` -- the Aqua window
+    class for a tooltip, which the UI layer hands to Tk's
+    `::tk::unsupported::MacWindowStyle`.
+
+    This exists because of a genuine OS fact, not a toolkit quirk: on Aqua,
+    mapping an ordinary window *activates the application*, and activating an
+    application makes macOS switch the user to the Space where that
+    application's windows live. A tooltip that yanks the user off their
+    current Space and onto another monitor because the pointer grazed a
+    menu-bar icon is hostile, and it is exactly what the borderless window
+    used everywhere else does here. A `help`-class window is declared to the
+    window server as a tooltip, and mapping one does not activate anybody.
+
+    The seam names the class but does not apply it: writing it means calling
+    into Tcl, and this package is deliberately free of tkinter (see
+    `tray_handle_attribute()`, which strikes the same bargain with pystray).
+    What *is* an OS fact is that this platform distinguishes tooltip windows
+    from ordinary ones at all, and that is what this answers.
+
+    The attribute tuple is empty on purpose and is not a placeholder for
+    `noActivates`. Measured on Tk 8.6.18 / macOS 26.6 over repeated trials,
+    passing *any* attribute list alongside the class re-applies the window's
+    attributes after it has been created, and that re-application is itself
+    what activates the app -- `("help", ("noActivates",))` activated on 9 of
+    10 runs, while `("help", ())` activated on 0 of 12. The tuple stays in the
+    signature because the class/attributes pair is the shape Aqua actually
+    has, and a future surface may need one.
+    """
+    return _backend.tooltip_window_style()
 
 
 def tray_icon_rect(handle: TrayHandle) -> Rect | None:

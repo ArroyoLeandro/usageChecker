@@ -130,6 +130,13 @@ def tray_handle_attribute() -> str | None:
     return "_hwnd"
 
 
+def tooltip_window_style() -> tuple[str, tuple[str, ...]] | None:
+    # No window-class distinction to make: a borderless topmost window is
+    # already a correct tooltip here, and showing one does not steal
+    # activation the way Aqua does.
+    return None
+
+
 def tray_icon_rect(handle: TrayHandle) -> Rect | None:
     """The screen rectangle of one notify icon, or `None` if unobtainable.
 

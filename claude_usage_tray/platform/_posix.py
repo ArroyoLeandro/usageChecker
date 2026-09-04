@@ -59,6 +59,12 @@ def tray_handle_attribute() -> str | None:
     return None
 
 
+def tooltip_window_style() -> tuple[str, tuple[str, ...]] | None:
+    # Same as Windows: nothing to declare. Also moot in practice, since
+    # `tray_hover_supported()` is False here and the native tooltip stands.
+    return None
+
+
 def tray_icon_rect(handle: TrayHandle) -> Rect | None:
     # No `Shell_NotifyIconGetRect` equivalent here, and no tray model this
     # app targets. "Cannot know", not "cannot do": the caller degrades to the

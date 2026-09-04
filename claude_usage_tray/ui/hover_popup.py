@@ -26,12 +26,15 @@ Two things it deliberately does NOT do, both of which the usage popup does:
 
 from __future__ import annotations
 
+import logging
 import tkinter as tk
 from typing import Any
 
 from .. import formatting
-from ..platform import Rect, WorkArea
+from ..platform import Rect, WorkArea, tooltip_window_style
 from ..theme import DEFAULT_THEME, Theme
+
+log = logging.getLogger(__name__)
 
 # Spanish labels for the quota keys `formatting.hover_sections` reports.
 # Owned here, not in `formatting`, exactly as `popup.py` owns its own row
@@ -120,6 +123,56 @@ def _section(parent: tk.Widget, section: formatting.HoverSection, theme: Theme, 
         _quota_row(block, QUOTA_LABELS.get(key, key), value, theme)
 
 
+def _declare_as_tooltip(popup: tk.Toplevel) -> None:
+    """Make `popup` a window the OS understands as a tooltip, if it has such
+    a notion, falling back to a plain borderless window if it does not.
+
+    Two different ways of saying "no chrome", and the platform picks:
+
+    - `overrideredirect(True)` everywhere the seam answers `None`. It strips
+      the decorations and nothing else, which is all Windows and Linux need.
+    - A declared window class where the seam names one. On macOS that matters
+      for a reason that has nothing to do with decoration: mapping an
+      ordinary window *activates the application*, and macOS answers an
+      activation by switching the user to the Space where that application's
+      windows live. Hovering a menu-bar icon would therefore throw the user
+      onto another Space -- reported as "me mueve a la pantalla principal".
+      Declaring the window `help` maps it without activating anyone.
+
+    Order matters and is not interchangeable: the class must be declared
+    before the window is mapped, and `overrideredirect` is *not* also applied
+    on top of it -- doing both re-applies the window's attributes and brings
+    the activation straight back.
+
+    Defensive by design. `MacWindowStyle` lives under `::tk::unsupported::`,
+    which is Tcl's way of promising nothing, so a Tk build that does not know
+    the class raises `TclError`. That must not cost the user their tooltip:
+    the fallback is the borderless window every other platform uses, which is
+    exactly the behaviour that shipped before this window class existed.
+    """
+    style = tooltip_window_style()
+    if style is None:
+        popup.overrideredirect(True)
+        return
+
+    window_class, attributes = style
+    try:
+        args = ["style", popup._w, window_class]
+        if attributes:
+            # Tk's signature is `style window ?class attributes?`: the
+            # attributes are ONE argument holding a Tcl list, not varargs.
+            args.append(" ".join(attributes))
+        popup.tk.call("::tk::unsupported::MacWindowStyle", *args)
+    except tk.TclError:
+        log.warning(
+            "this Tk build rejected the %r tooltip window class; "
+            "falling back to a borderless window",
+            window_class,
+            exc_info=True,
+        )
+        popup.overrideredirect(True)
+
+
 def _place(popup: tk.Toplevel, rect: Rect, work_area: WorkArea | None) -> None:
     """Put the popup beside the tray icon, clamped inside the usable desktop.
 
@@ -179,7 +232,7 @@ def show_hover_popup(
     palette = theme.palette
     popup = tk.Toplevel(root)
     popup.withdraw()  # place it before it is ever seen, so it cannot flash
-    popup.overrideredirect(True)
+    _declare_as_tooltip(popup)
     popup.configure(bg=palette.bg)
     popup.attributes("-topmost", True)
 
