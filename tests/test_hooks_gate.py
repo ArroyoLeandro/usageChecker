@@ -231,3 +231,145 @@ def test_the_silent_path_never_touches_the_network(app_data_dir, monkeypatch):
 
     assert gate.run(_prompt_event()) is None
     assert gate.run(_tool_event()) is None
+
+
+# --- resumed sessions: environment id vs. event id --------------------------
+# Claude Code keeps a resumed session's original conversation id -- the one
+# `hooks/gate.py` reads from the event payload -- but spawns a *new* MCP
+# server process for it, with `CLAUDE_CODE_SESSION_ID` set to a different
+# value. `set_usage_budget` only ever sees that environment id, so without the
+# alias `session_of` now records, a ceiling written from inside a resumed
+# session is filed under an id this gate never looks up: `/usage-override`
+# appears to succeed while silently writing to a file nobody reads.
+
+
+def test_a_ceiling_written_under_the_environment_id_is_read_under_the_event_id(
+    app_data_dir, at_percent, monkeypatch
+):
+    """The regression this whole mechanism exists to fix. FAILS without the
+    alias mechanism: pre-fix, `save_budget` called with no explicit
+    `session_id` (exactly how `set_usage_budget` calls it) writes under the
+    environment id, `load_budget` in `decide()` reads under the event id
+    `session_of` returns, and the two files never meet -- the gate sees no
+    budget and lets the turn through unblocked."""
+    monkeypatch.setenv(budget_module.SESSION_ENV, "env-mcp-session")
+    at_percent(96.0)
+
+    # A gate evaluation observes both ids and records the correspondence --
+    # any real `UserPromptSubmit` does this before a budget is ever set, so
+    # the alias is on record ahead of the write below.
+    assert gate.run(_prompt_event(session_id="event-conversation-session")) is None
+
+    # The writer, called exactly as `mcp_server/server.py`'s
+    # `set_usage_budget` calls it: no explicit `session_id`, only whatever
+    # `current_session_id()` reads from the environment.
+    budget_module.save_budget(Budget(ceiling_percent=95.0))
+
+    output = gate.run(_prompt_event(session_id="event-conversation-session"))
+
+    assert output is not None
+    assert output["decision"] == "block"
+    assert "95%" in output["reason"]
+
+
+def test_raising_the_ceiling_from_a_blocked_resumed_session_unblocks_the_next_prompt(
+    app_data_dir, at_percent, monkeypatch
+):
+    """`/usage-override <percent>` must actually reach the session it is
+    typed into, even when that session has been resumed."""
+    monkeypatch.setenv(budget_module.SESSION_ENV, "env-mcp-session-2")
+    at_percent(80.0)
+    # A ceiling set two days ago, back when this was a fresh session and the
+    # event id and environment id still agreed -- the scenario the bug
+    # report describes.
+    budget_module.save_budget(Budget(ceiling_percent=70.0), "event-conversation-session-2")
+
+    blocked = gate.run(_prompt_event(session_id="event-conversation-session-2"))
+    assert blocked["decision"] == "block"
+
+    # The override prompt passes on its own token, and records the alias as
+    # a side effect of being evaluated.
+    passthrough = gate.run(
+        _prompt_event(f"/usage-override 95 {gate.OVERRIDE_TOKEN}", "event-conversation-session-2")
+    )
+    assert passthrough is None
+    # The write `/usage-override 95` triggers: no explicit `session_id`,
+    # exactly like `set_usage_budget`.
+    budget_module.save_budget(Budget(ceiling_percent=95.0))
+
+    unblocked = gate.run(_prompt_event(session_id="event-conversation-session-2"))
+
+    assert unblocked is None
+
+
+def test_clearing_the_ceiling_from_a_resumed_session_actually_clears_it(app_data_dir, at_percent, monkeypatch):
+    monkeypatch.setenv(budget_module.SESSION_ENV, "env-mcp-session-3")
+    at_percent(99.0)
+    budget_module.save_budget(Budget(ceiling_percent=70.0), "event-conversation-session-3")
+
+    blocked = gate.run(_prompt_event(session_id="event-conversation-session-3"))
+    assert blocked["decision"] == "block"
+
+    # `/usage-override off` clears the ceiling: `set_usage_budget(clear=True)`
+    # called with no explicit `session_id`.
+    budget_module.clear_budget()
+
+    cleared = gate.run(_prompt_event(session_id="event-conversation-session-3"))
+
+    assert cleared is None
+
+
+def test_the_unresumed_case_records_no_alias_and_behaves_exactly_as_before(app_data_dir, at_percent):
+    """When the event id and environment id already agree -- the ordinary,
+    non-resumed case every existing test in this file exercises -- nothing
+    new happens: no alias file is written, and the gate's behaviour is
+    unchanged from before this mechanism existed."""
+    budget_module.save_budget(Budget(ceiling_percent=70, warn_margin=5))
+    at_percent(90.0)
+
+    output = gate.run(_prompt_event())  # default session_id equals the env id
+
+    assert output["decision"] == "block"
+    assert list(budget_module.paths.alias_dir().glob("*.json")) == []
+
+
+def test_gate_run_survives_a_record_alias_failure_and_returns_its_normal_decision(
+    app_data_dir, at_percent, monkeypatch
+):
+    """`session_of` calls `budget.record_alias` on every single event with
+    no guard of its own around the call -- it depends entirely on
+    `record_alias` being total (see that function's docstring). This drives
+    `gate.run` directly, not through `gate.main()`'s process-level `except
+    Exception`, so it is specifically `record_alias`'s own fail-open
+    hardening under test here: simulate the write step inside it failing,
+    on a resumed-session event where `session_of` actually attempts to
+    record an alias (event id and environment id differ), and confirm the
+    gate's verdict for that event comes back exactly as if nothing had gone
+    wrong.
+
+    The budget lives directly under the id `session_of` returns for this
+    event -- as it would for a session that was fresh when the ceiling was
+    set, or one whose writer had already resolved through a *previously*
+    recorded alias -- precisely so this read never itself depends on the
+    alias `session_of` is about to fail to record. That keeps the test
+    isolated to one thing: a broken `record_alias` write must not corrupt
+    or prevent the decision `gate.run` returns.
+    """
+    budget_module.save_budget(Budget(ceiling_percent=70, warn_margin=5), "event-resumed-session")
+    at_percent(90.0)
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("disk exploded mid-write")
+
+    monkeypatch.setattr(budget_module.jsonstore, "write_json_atomic", _explode)
+
+    # session_id differs from the environment's "session-alpha", so
+    # session_of() calls record_alias() for this event -- and record_alias's
+    # own write attempt is what hits the monkeypatched failure above.
+    output = gate.run(_prompt_event(session_id="event-resumed-session"))
+
+    assert output["decision"] == "block"
+    assert "USAGE BUDGET REACHED" in output["reason"]
+    # The failure really was hit and swallowed, not sidestepped for some
+    # unrelated reason: no alias ended up on record.
+    assert list(budget_module.paths.alias_dir().glob("*.json")) == []

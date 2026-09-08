@@ -238,10 +238,21 @@ El techo vale para **esa** sesión de Claude y para los subagentes que lance —
 no para todo Claude. Las otras terminales que tengas abiertas siguen igual.
 
 Funciona porque Claude Code exporta `CLAUDE_CODE_SESSION_ID` a todo proceso que
-arranca, y un subagente hereda el del padre. Escritor (el tool MCP) y lector (el
-hook) ven el mismo valor, así que "este agente y todo lo que él levantó" es
-exactamente una clave. Cada sesión guarda su techo en su propio archivo dentro
-de `budgets/`, así que dos sesiones fijando techo al mismo tiempo no se pisan.
+arranca, y un subagente hereda el del padre. Cada sesión guarda su techo en su
+propio archivo dentro de `budgets/`, así que dos sesiones fijando techo al
+mismo tiempo no se pisan.
+
+Escritor (el tool MCP) y lector (el hook) ven el mismo valor **en una sesión
+recién arrancada**, pero no siempre: al retomar una conversación (`--resume`),
+la conversación conserva su id de siempre -- el que lee el hook -- mientras
+que Claude Code levanta un server MCP nuevo con un `CLAUDE_CODE_SESSION_ID`
+propio, distinto. Sin nada más, un techo fijado desde esa sesión resumida
+quedaría archivado bajo un id que el hook nunca busca, y el `/usage-override`
+que debería levantarlo aparentaría funcionar sin hacer nada. Por eso el hook
+-- el único lugar que ve los dos ids juntos -- graba la correspondencia entre
+ambos (en un directorio aparte, `aliases/`) cada vez que difieren, y el techo
+la sigue de vuelta al id que corresponde, encadenando varios saltos si hace
+falta. Nada de esto es visible desde afuera: se resuelve solo.
 
 El precio, que conviene tener claro: con tres sesiones abiertas se pueden gastar
 tres techos entre todas. El techo acota al agente que apuntaste, no a la cuenta.
@@ -306,6 +317,14 @@ Desde afuera de Claude siempre funciona borrar el archivo:
 rm ~/.config/ClaudeUsage/budgets/<session-id>.json   # %APPDATA%\ClaudeUsage\budgets\ en Windows
 ```
 
+Si la sesión fue **resumida**, el techo normalmente termina archivado bajo el
+mismo `<session-id>` de la conversación que ya conocés -- eso es justamente lo
+que resuelve automáticamente el mecanismo de alias que se describe en
+"Dónde se guardan los datos" más abajo. Si de todas formas no aparece ahí, ese
+directorio (`aliases/`) es donde vive la correspondencia interna entre el id
+de entorno del server MCP y el id de la conversación, y sirve para rastrear
+manualmente bajo qué nombre terminó el archivo.
+
 Esa exención es también la única vía por la que un agente podría levantarse el
 techo a sí mismo, así que el mensaje de bloqueo le dice explícitamente que no lo
 haga y que sólo vos podés cambiarlo. Es una instrucción, no una barrera: si
@@ -330,6 +349,7 @@ En Windows, todo vive en `%APPDATA%\ClaudeUsage\` (normalmente
 - `config.json` — perfiles (con su servicio) y preferencias (tema, colores, alertas). Es por computadora: cualquier ejecución de la app lee y escribe este mismo archivo.
 - `alert-state.json` — estado interno de las alertas (qué se notificó y cuándo). Se puede borrar sin perder configuración.
 - `budgets/<session-id>.json` — el techo de cada sesión que fijó uno. Borrar el archivo equivale a `/usage-budget off` en esa sesión. Los que quedan de sesiones muertas se barren solos a los 7 días.
+- `aliases/<id-de-entorno>.json` — sólo aparece si retomaste una sesión (`--resume`) y ese proceso llegó a fijar o consultar un techo. Guarda la correspondencia entre el `CLAUDE_CODE_SESSION_ID` que ve el server MCP de esa sesión y el id de conversación que lee el hook -- son distintos en una sesión resumida, ver "Alcance" más arriba. También se barre solo a los 7 días, igual que `budgets/`.
 - `usage-cache-<cuenta>.json` — la última cifra de uso que leyó el hook, una por cuenta. Machine-written y descartable: sin esto, el hook haría una llamada a la API antes de cada prompt y de cada tool.
 - `claude-usage.log` — registro de diagnóstico. Si algo falla, el error queda acá (la app se compila sin consola, así que este archivo es la forma de ver qué pasó).
 

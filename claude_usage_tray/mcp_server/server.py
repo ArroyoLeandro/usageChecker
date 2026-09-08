@@ -153,9 +153,29 @@ def set_budget(
     obliged to enforce `minimum`/`maximum`, and a ceiling of 0 or 500 would
     produce a gate that blocks everything or nothing while looking correctly
     configured from the outside.
+
+    **Never passes its session id explicitly, deliberately.** This process
+    only ever sees `CLAUDE_CODE_SESSION_ID` -- a resumed session's
+    environment id, not the conversation id `hooks/gate.py` reads budgets
+    under (see `budget.py`'s `SESSION_ENV` docstring). `budget._resolve`
+    runs the alias lookup only on its *implicit* path (no id given),
+    precisely so that an id a caller already names -- like the conversation
+    id `session_of` hands `load_budget` explicitly on the read side -- is
+    never redirected by a map built to translate a different kind of id.
+    So `save_budget`/`clear_budget` below are called with no `session_id`
+    argument at all, letting them resolve the environment id through
+    `budget.resolved_session_id()` themselves. Reading `current_session_id()`
+    here and threading *that* through explicitly, as this function used to,
+    would fall on the wrong side of that split and silently reintroduce the
+    original bug: the explicit path trusts what it is given, so a raw
+    environment id handed to it explicitly stops right there instead of
+    being followed to the id the gate reads. `current_session_id()` is
+    still read once below, but only to answer "is there a session at all"
+    and to report which id the ceiling ended up filed under -- never to
+    hand a caller-named id to the store functions.
     """
-    session_id = budget_module.current_session_id()
-    if session_id is None:
+    env_id = budget_module.current_session_id()
+    if env_id is None:
         # The server was not spawned by Claude Code, so there is no session
         # to attach a ceiling to. Saying so is far better than writing a
         # budget nothing will ever read.
@@ -167,9 +187,14 @@ def set_budget(
                 "by Claude Code."
             ),
         }
+    # For the response only -- what the ceiling actually ends up filed
+    # under. `save_budget`/`clear_budget` below resolve this exact id
+    # themselves, on their implicit path; this is not threaded through to
+    # them; see the docstring above for why not.
+    session_id = budget_module.resolved_session_id()
 
     if clear:
-        removed = budget_module.clear_budget(session_id)
+        removed = budget_module.clear_budget()
         return {"ok": True, "budget": None, "cleared": removed, "session_id": session_id}
 
     if ceiling_percent is None:
@@ -188,7 +213,7 @@ def set_budget(
         note=note,
         windows=budget_module.parse_windows(windows),
     )
-    budget_module.save_budget(active, session_id)
+    budget_module.save_budget(active)
     return {
         "ok": True,
         "budget": _budget_view(active),
@@ -243,6 +268,11 @@ def get_usage(config_dir: str | None = None, *, force_refresh: bool = False) -> 
     # see 66% but not the 70% cap has no way to know it is three points from
     # being cut off, which is precisely the moment it should be finishing up
     # rather than starting something new.
+    #
+    # Called with no explicit id, deliberately: this is the implicit path,
+    # so `budget._resolve` already resolves the environment id through any
+    # recorded alias on its own. Nothing to thread through by hand here, the
+    # way `set_budget` above must for its explicit calls.
     active = budget_module.load_budget()
     report["budget"] = _budget_view(active)
     if active is not None:

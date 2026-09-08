@@ -18,6 +18,7 @@ from . import platform
 CONFIG_FILENAME = "config.json"
 ALERT_STATE_FILENAME = "alert-state.json"
 BUDGET_DIRNAME = "budgets"
+ALIAS_DIRNAME = "aliases"
 USAGE_CACHE_FILENAME = "usage-cache.json"
 LOG_FILENAME = "claude-usage.log"
 APP_DATA_DIRNAME = "ClaudeUsage"
@@ -75,6 +76,43 @@ def budget_file(session_id: str) -> Path:
     holds it in memory and rewrites it whole.
     """
     return budget_dir() / f"{safe_session_token(session_id)}.json"
+
+
+def alias_dir() -> Path:
+    """Directory holding one recorded session-id correspondence per
+    environment session id.
+
+    A budget is keyed by the conversation id `hooks/gate.py` reads from its
+    event payload, but `set_usage_budget` only ever sees
+    `CLAUDE_CODE_SESSION_ID` -- the id of the MCP server process, which is a
+    *different* id once the session has been resumed. This directory holds
+    the mapping the gate records from environment id to conversation id, so
+    `budget._resolve` can follow a writer's environment id back to the id
+    the gate actually reads. See `budget.py`'s `SESSION_ENV` docstring for
+    why the two diverge and `budget.record_alias` for what gets written here.
+    """
+    return app_data_dir() / ALIAS_DIRNAME
+
+
+def alias_file(env_session_id: str) -> Path:
+    """Canonical path for one environment session id's recorded alias.
+
+    One file per environment id, for the same anti-race reason
+    `budget_file` gives for ceilings: several sessions can be recording an
+    alias at once, each through `write_json_atomic`, which replaces a file
+    wholesale, and a shared map would let one session's write silently
+    clobber another's.
+
+    `safe_session_token` is shared with `budget_file`, and a collision under
+    it costs more here than there: two budget ids colliding means two
+    sessions share one ceiling, but two *alias* ids colliding means one
+    session's ceiling gets silently routed to whatever third session the
+    collision happens to land on -- traversal itself stays genuinely
+    prevented (the same `[A-Za-z0-9._-]` allowlist, single path component,
+    no way out of `alias_dir()`), it is specifically the token collision
+    that costs more here.
+    """
+    return alias_dir() / f"{safe_session_token(env_session_id)}.json"
 
 
 def usage_cache_file(account_token: str) -> Path:

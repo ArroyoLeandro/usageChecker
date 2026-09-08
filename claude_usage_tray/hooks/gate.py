@@ -82,16 +82,43 @@ _USER_HINT = (
 
 
 def session_of(event: dict[str, Any]) -> str | None:
-    """Which session's ceiling applies to this event.
+    """Which session's ceiling applies to this event -- and the one place in
+    the whole codebase where both candidate ids are ever in hand together.
 
     The event's own `session_id` first, the environment second. They agree
-    in practice -- verified against a live `PreToolUse` event and the
+    in a fresh session -- verified against a live `PreToolUse` event and the
     `/proc` environment of the MCP server serving the same session -- but
     the event is the more specific claim, so it wins, and the environment
     keeps the gate working on any event shape that omits the field.
+
+    They stop agreeing once the session is resumed: Claude Code keeps the
+    original conversation id (the event's) but spawns a new MCP server
+    process with its own, different `CLAUDE_CODE_SESSION_ID` (see
+    `budget.py`'s `SESSION_ENV` docstring). `set_usage_budget` only ever
+    sees that environment id, so a ceiling it writes would otherwise be
+    filed under an id this function -- and therefore every load below --
+    never looks up. Because a hook evaluation is the only moment both ids
+    are observed at once, this is also the only place that can repair that:
+    whenever they are both present and differ, the correspondence is handed
+    to `budget.record_alias`, which persists it so `budget.resolved_session_id`
+    can follow a writer's raw environment id back to the event id used here.
+    This does not change what `session_of` returns -- the event id still
+    wins, exactly as before, and it is passed to `budget.load_budget` as an
+    *explicit* argument, which by design is never itself run back through
+    the alias (see `budget._resolve`'s docstring): the id this function
+    settles on is the authoritative one, not a guess to be redirected. What
+    changes is only the other side: `set_usage_budget` (`mcp_server/server.py`)
+    now calls `save_budget`/`clear_budget` with no explicit id at all,
+    letting them resolve the environment id through the alias themselves --
+    instead of reading the raw, unresolved environment id and passing it
+    through explicitly, which is what used to file a ceiling under an id
+    this function never returns.
     """
     from_event = str(event.get("session_id") or "").strip()
-    return from_event or budget_module.current_session_id()
+    env_id = budget_module.current_session_id()
+    if from_event and env_id and from_event != env_id:
+        budget_module.record_alias(env_id, from_event)
+    return from_event or env_id
 
 
 def decide(prompt: str = "", session_id: str | None = None) -> budget_module.Decision:

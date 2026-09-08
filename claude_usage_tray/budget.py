@@ -16,6 +16,12 @@ between them -- exactly the situation `quotas.py` documents. The shared fact
 has to fall to a layer both can reach, or it becomes two copies that agree
 only by luck.
 
+The session-id alias store (`record_alias`, `_resolve_alias`, below) lives
+here for the identical reason: both `mcp_server/server.py` (via
+`set_usage_budget`) and `hooks/gate.py` need "which session does this
+environment id actually mean", and the same L5-peers-cannot-import-each-other
+rule that put the ceiling policy here applies to the id it is keyed by.
+
 **Fail open, always.** Every unknown here resolves to `allow`: no budget
 set, usage unreadable, the API down, the file corrupt. A gate that fails
 closed on a network blip locks the user out of their own Claude until a
@@ -42,9 +48,26 @@ DEFAULT_WARN_MARGIN = 5.0
 #: Exported by Claude Code into every process it spawns -- the MCP server
 #: that writes a budget and the hook that reads it both see the same value,
 #: and a subagent inherits its parent's, which is what makes "this agent and
-#: the subagents it launched" expressible as a single key. Verified by
-#: reading `/proc/<pid>/environ` of a live child MCP server and by the
-#: `session_id` a `PreToolUse` event carries: all three agree.
+#: the subagents it launched" expressible as a single key. True for a fresh
+#: session, verified by reading `/proc/<pid>/environ` of a live child MCP
+#: server and by the `session_id` a `PreToolUse` event carries.
+#:
+#: **A resumed session breaks that agreement.** The conversation keeps its
+#: original id -- the one `hooks/gate.py` reads straight from the event
+#: payload, and the one the user thinks of as "this session" -- but Claude
+#: Code starts a *new* MCP server process for it, with this environment
+#: variable set to that process's own, different id. `set_usage_budget` only
+#: ever sees the environment id, so a ceiling written from inside a resumed
+#: session is filed under an id the gate never looks up: `/usage-override`
+#: appears to succeed and silently writes to a file nobody reads, leaving a
+#: blocked session with no way to unblock itself. `hooks/gate.py`'s
+#: `session_of` is the one place that observes both ids on the same event,
+#: so it records the correspondence (`record_alias`, below) whenever they
+#: differ, and `resolved_session_id()` -- the implicit path through
+#: `_resolve`, below -- follows it back whenever a caller reads the
+#: environment id rather than naming a session it already knows. An
+#: explicitly named id is never run through this lookup; see `_resolve`'s
+#: docstring for why that asymmetry is the whole point of the mechanism.
 SESSION_ENV = "CLAUDE_CODE_SESSION_ID"
 
 #: Budgets older than this are swept on the next write. A ceiling belongs to
@@ -273,8 +296,207 @@ def current_session_id() -> str | None:
     return value or None
 
 
+#: Field names for a stored alias. Kept short and separate from
+#: `to_mapping`'s budget keys because an alias file and a budget file are
+#: different shapes living in different directories -- nothing ever reads
+#: both from the same payload.
+_ALIAS_ENV_KEY = "env_session_id"
+_ALIAS_EVENT_KEY = "event_session_id"
+
+#: How many alias hops `_resolve_alias` will follow before giving up and
+#: failing open with wherever it has gotten to.
+#:
+#: A real chain is at most one hop per time a session has been resumed in a
+#: row -- `E2 -> E1 -> C` after two resumes, one more link per resume after
+#: that -- and nobody resumes the same conversation eight times before its
+#: first prompt. Unbounded following, by contrast, turns a corrupted map or
+#: a two-file cycle (`A -> B`, `B -> A`, both perfectly writable individually)
+#: into either an infinite loop or a `RecursionError`, either of which is a
+#: gate that no longer fails open -- exactly the failure this module's
+#: fail-open promise forbids. Eight is generous headroom over the plausible
+#: case while still bounding the cost of a hostile or corrupted directory to
+#: a handful of file reads.
+_MAX_ALIAS_HOPS = 8
+
+
+def record_alias(env_session_id: str, event_session_id: str) -> None:
+    """Remember that the MCP server's environment id actually means the
+    hook's event id, for a resumed session where the two have diverged.
+
+    `hooks/gate.py`'s `session_of` is the only call site: a hook evaluation
+    is the one moment in the whole system where both ids are in hand at
+    once, because the event payload carries one and `os.environ` carries the
+    other. Everywhere else -- `set_usage_budget`, the tray -- only the
+    environment id exists to read.
+
+    A no-op, deliberately, whenever there is nothing worth recording: either
+    id blank, or the two already equal. The equal case is not just an
+    optimisation -- it is what keeps a plain, non-resumed session from ever
+    growing an `aliases/` directory at all, since `_resolve_alias` below
+    would answer the same environment id back regardless of whether the file
+    exists.
+
+    Writes only when the stored mapping is absent or different. This runs
+    on the hot path -- `session_of` is called for every prompt *and* every
+    tool call, so a resumed session reaches here thousands of times -- and
+    re-writing an identical mapping each time would put a temp-file-plus-
+    rename and a full `sweep_stale()` directory walk in front of every tool
+    call the user makes, to record a fact that has not changed since the
+    first one. Re-reading it first is the cheaper half of that trade, and
+    the write stays last-write-wins for the case where the mapping genuinely
+    does change.
+
+    Every operation that touches disk here -- the skip-if-unchanged read,
+    the `mkdir`, the write, the trailing `sweep_stale()` -- sits inside one
+    `try` that catches `Exception`, not just `OSError`, so the function is
+    total: nothing it does can escape as an exception, whatever the failure
+    mode. That matters beyond this module's own I/O, because `session_of`
+    (`hooks/gate.py`) calls this on every prompt and every tool call with no
+    guard of its own around the call; a raise here would surface there. In
+    practice `gate.main()` already wraps its entire dispatch in a
+    process-level `except Exception`, so a raise here would not crash the
+    harness -- but it *would* discard whatever `run()` had already decided
+    for this event, turning a routine allow/warn/block verdict into total
+    silence for that one prompt. Catching here keeps that outcome from ever
+    depending on how far up the call stack a broad handler happens to sit.
+    An unwritable `aliases/` directory, either way, costs the user a
+    `/usage-override` that lands on the wrong id -- the bug this mechanism
+    exists to fix, no worse than before it existed, and a strictly smaller
+    cost than losing the gate's verdict for the event that triggered it.
+    """
+    env_id = (env_session_id or "").strip()
+    event_id = (event_session_id or "").strip()
+    if not env_id or not event_id or env_id == event_id:
+        return
+    try:
+        if _resolve_alias(env_id) == event_id:
+            return
+        target = paths.alias_file(env_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        jsonstore.write_json_atomic(target, {_ALIAS_ENV_KEY: env_id, _ALIAS_EVENT_KEY: event_id})
+        sweep_stale()
+    except Exception:  # noqa: BLE001 -- see docstring: this function must be total
+        return
+
+
+def _resolve_alias(env_session_id: str) -> str:
+    """Follow a recorded alias chain from `env_session_id` to the id it
+    ultimately stands for, or return `env_session_id` unchanged if there is
+    none recorded for it.
+
+    A single hop is not enough. A session resumed twice in a row writes two
+    links -- `E1 -> C` from the first resume, then `E2 -> E1` from the
+    second -- and a writer holding only `E2` has to cross both to land on
+    `C`, the id `hooks/gate.py` actually reads budgets under. Stopping after
+    one hop would resolve `E2` to `E1` and write `budgets/E1.json`, while the
+    reader still reads `budgets/C.json`: the exact divergence this whole
+    mechanism exists to close, reopened one resume later.
+
+    So this follows the chain: read the alias for the current id, and if one
+    exists, move to it and read again, up to `_MAX_ALIAS_HOPS` times. It
+    stops and returns the current id as soon as a step has no alias
+    recorded -- the terminal, common case -- and also stops and returns the
+    current id (not the id that would be visited next) the moment the next
+    hop would revisit an id already seen in this call, which is the only way
+    a chain can fail to terminate (`A -> B`, `B -> A`, or a longer cycle
+    built the same way). Both of those are fail-open outcomes, consistent
+    with every other read in this module: a missing file (the overwhelming
+    majority of calls -- most sessions are never resumed at all), a corrupt
+    one, one hand-edited into a shape without a usable string, a cycle, or a
+    chain longer than the bound all resolve to "stop here and use the best
+    id found so far" rather than raising or looping. This function must
+    never raise and must never block a prompt over a detail as small as a
+    diagnostic mapping failing to parse or looping back on itself.
+    """
+    current = env_session_id
+    visited = {current}
+    for _ in range(_MAX_ALIAS_HOPS):
+        try:
+            payload = jsonstore.read_json(paths.alias_file(current))
+        except (jsonstore.CorruptFile, OSError):
+            return current
+        if not isinstance(payload, dict):
+            return current
+        aliased = payload.get(_ALIAS_EVENT_KEY)
+        if not (isinstance(aliased, str) and aliased.strip()):
+            return current
+        next_id = aliased.strip()
+        if next_id in visited:
+            # A cycle: following further would repeat ids forever. `current`
+            # is the furthest this chain could progress before it would
+            # start retracing itself, so that -- not `next_id`, which is
+            # what closes the loop -- is the fail-open answer.
+            return current
+        visited.add(next_id)
+        current = next_id
+    # The bound was reached without hitting a terminal id or a cycle: an
+    # implausibly long chain, or a corrupted map that keeps producing new
+    # ids forever. Fail open with the last id actually reached rather than
+    # keep reading indefinitely.
+    return current
+
+
+def resolved_session_id() -> str | None:
+    """The environment session id, translated through any alias recorded
+    for it -- the public counterpart to `current_session_id()` for callers
+    that want the id a budget should actually be filed under.
+
+    `current_session_id()` stays a raw, unaliased read on purpose: it is
+    what `hooks/gate.py`'s `session_of` needs to record an alias correctly
+    in the first place (recording `env -> event` requires the *unresolved*
+    environment id, not wherever an existing alias would already redirect
+    it), and it is also the leaf primitive `_resolve_alias` above must not
+    itself depend on. This function is the other side of that split: read
+    the environment, then follow whatever alias chain is on record for it.
+    `_resolve`, below, calls this for every implicit (no `session_id`
+    argument) store operation -- which is how `set_usage_budget`
+    (`mcp_server/server.py`) reaches it: that function calls
+    `save_budget`/`clear_budget` with no explicit id at all, so this is what
+    actually resolves the environment id it runs in before either function
+    touches a file.
+    """
+    env_id = current_session_id()
+    if env_id is None:
+        return None
+    return _resolve_alias(env_id)
+
+
 def _resolve(session_id: str | None) -> str | None:
-    return session_id if session_id else current_session_id()
+    """The session id every store operation below actually keys on.
+
+    The split that fixes the aliasing bug: an explicit `session_id` is
+    returned exactly as given, with no alias lookup at all, while the
+    implicit path -- no argument, meaning "whatever session this process is
+    in" -- resolves through `resolved_session_id()`, environment plus alias.
+
+    That asymmetry is deliberate, not an oversight. An explicit id is a
+    caller naming a *specific* session it already means: a test id, or
+    `hooks/gate.py`'s `session_of` handing over the conversation id it read
+    straight from the event payload -- the one id in this whole system that
+    is authoritative by construction and must never be redirected by a map
+    built to translate a *different* kind of id (environment ids). Running
+    every explicit id through `_resolve_alias` unconditionally, as an
+    earlier version of this function did, could not tell those two apart:
+    an alias recorded because some environment id `X` once meant conversation
+    `Y` would just as happily fire the day `X` was itself an authoritative
+    conversation id passed in explicitly, silently rerouting one session's
+    reads and writes onto another's file. `set_usage_budget`
+    (`mcp_server/server.py`) is the reason the implicit path exists at all:
+    it only ever has an environment id to start from, and it deliberately
+    never resolves that id itself or passes it to `save_budget`/
+    `clear_budget` explicitly -- it calls them bare, with no `session_id`
+    argument, so it is *this* function, via `resolved_session_id()`, that
+    turns the environment id into the id the gate reads. Passing a
+    caller-resolved id through explicitly instead would put that id on the
+    "trust it as given" side of this same split one call too early, for no
+    benefit -- there is nothing left to resolve by the time it would arrive
+    -- and every future explicit caller added to this module would then have
+    to remember not to do the same by accident. Simplest to keep exactly one
+    path that ever performs this resolution.
+    """
+    if session_id:
+        return session_id
+    return resolved_session_id()
 
 
 def load_budget(session_id: str | None = None) -> Budget | None:
@@ -326,23 +548,33 @@ def clear_budget(session_id: str | None = None) -> bool:
 
 
 def sweep_stale(*, max_age_seconds: int = STALE_BUDGET_AGE_SECONDS, now: float | None = None) -> int:
-    """Delete budgets left behind by sessions that have long since ended.
+    """Delete budgets, and recorded aliases, left behind by sessions that
+    have long since ended.
+
+    Both directories share `STALE_BUDGET_AGE_SECONDS` rather than each
+    getting its own constant: an alias and the budget it exists to route to
+    are retired by the same event -- the session ending -- so a second
+    staleness window would be one more number to keep in sync with the
+    first for no gained precision. Without this, `aliases/` would grow one
+    dead file per *resumed* session, forever, exactly as `budgets/` would
+    without the budget half of this sweep.
 
     Best effort throughout: a directory that cannot be listed, or a file
     that cannot be removed, is not a reason to fail the write that triggered
-    the sweep.
+    the sweep, and a failure sweeping one directory must not skip the other.
     """
     now = time.time() if now is None else now
     removed = 0
-    try:
-        entries = list(paths.budget_dir().glob("*.json"))
-    except OSError:
-        return 0
-    for entry in entries:
+    for directory in (paths.budget_dir(), paths.alias_dir()):
         try:
-            if now - entry.stat().st_mtime > max_age_seconds:
-                entry.unlink()
-                removed += 1
+            entries = list(directory.glob("*.json"))
         except OSError:
             continue
+        for entry in entries:
+            try:
+                if now - entry.stat().st_mtime > max_age_seconds:
+                    entry.unlink()
+                    removed += 1
+            except OSError:
+                continue
     return removed

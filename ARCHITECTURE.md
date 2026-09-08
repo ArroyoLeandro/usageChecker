@@ -121,12 +121,30 @@ Tres invariantes que no conviene romper:
   aceptable para un compuesto con guión que nadie escribe por accidente.
 - **El alcance es la sesión, no la máquina.** Claude Code exporta
   `CLAUDE_CODE_SESSION_ID` a todo proceso que arranca y un subagente hereda el
-  del padre, así que "este agente y lo que él levantó" es una sola clave que el
-  escritor (el tool MCP) y el lector (el hook) ven igual. Verificado leyendo
+  del padre, así que "este agente y lo que él levantó" es una sola clave. Un
+  archivo por sesión, no un mapa compartido, porque `write_json_atomic`
+  reemplaza el archivo entero y dos sesiones fijando techo a la vez serían una
+  carrera con un perdedor silencioso.
+- **Escritor y lector NO siempre ven el mismo id.** Verificado leyendo
   `/proc/<pid>/environ` de un server MCP hijo vivo y el `session_id` de un
-  evento `PreToolUse` real: los tres coinciden. Un archivo por sesión, no un
-  mapa compartido, porque `write_json_atomic` reemplaza el archivo entero y dos
-  sesiones fijando techo a la vez serían una carrera con un perdedor silencioso.
+  evento `PreToolUse` real: coinciden en una sesión recién arrancada, pero una
+  sesión *resumida* (`--resume`, o retomar una conversación vieja) rompe esa
+  igualdad. La conversación conserva su id original -- el que lee el hook
+  directamente del evento -- pero Claude Code levanta un proceso de server MCP
+  nuevo, con `CLAUDE_CODE_SESSION_ID` seteado a un id propio, distinto. El
+  server MCP (`set_usage_budget`) sólo ve ese segundo id, así que un techo que
+  fija desde una sesión resumida queda archivado bajo un id que el hook nunca
+  busca. El hook es el único lugar que tiene los dos ids a la vez -- el evento
+  le da uno y el entorno el otro -- así que graba la correspondencia (un
+  archivo por id de entorno, en `aliases/`) cada vez que difieren, y el store
+  de `budget.py` la sigue -- encadenando varios saltos si hace falta, con un
+  tope de saltos y detección de ciclos para no colgarse ante un mapa
+  corrupto -- pero *sólo* cuando el llamador no nombra un id explícito. Un id
+  que un llamador ya nombra (el que el hook le pasa a `load_budget` al leer,
+  por ejemplo) nunca se redirige: si se tradujera también ese caso, un id que
+  alguna vez sirvió como id de entorno de otra sesión podría desviar
+  silenciosamente la lectura o la escritura de una sesión que no tiene nada
+  que ver.
 - **`hooks/` no puede importar `mcp_server/`.** Los dos son capa 5. Por eso
   `accounts.py` bajó a L3 y `budget.py` está en L2: la cifra que se le muestra
   al agente y la que lo frena tienen que ser la misma función, o el día que
